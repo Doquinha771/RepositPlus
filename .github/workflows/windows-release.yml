@@ -1,0 +1,51 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 (developer build only)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: dev/requirements-build.txt
+
+      - name: Install developer packagers
+        shell: powershell
+        run: choco install innosetup upx --yes --no-progress
+
+      - name: Test + build standalone Windows apps
+        shell: cmd
+        run: dev\BUILD.bat all
+
+      - name: Upload compiled apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: RepositPlus-Windows
+          path: |
+            dev/out/*.exe
+            dev/out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem dev/out -File | Where-Object { $_.Extension -eq '.exe' -or $_.Name -eq 'SHA256SUMS.txt' }
+          if (-not $files) { throw 'Nenhum artefato compilado encontrado.' }
+          gh release create "${{ github.ref_name }}" $files.FullName --generate-notes --title "Reposit+ ${{ github.ref_name }}"
