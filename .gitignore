@@ -1,0 +1,22 @@
+# Python/dev
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.reposit-dev/
+
+# Developer build only
+dev/.venv-build/
+dev/.build/
+dev/out/
+*.exe
+*.msi
+*.zip
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+dev/profile-results/

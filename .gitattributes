@@ -1,0 +1,11 @@
+* text=auto
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+
+# Developer internals never belong to git-archive release source bundles.
+dev/ export-ignore
+.github/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
