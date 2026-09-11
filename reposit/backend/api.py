@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .backups import export_reposit, import_reposit
-from .config import APP_NAME, APP_VERSION, DEFAULT_SETTINGS, AppPaths, save_settings
+from .config import APP_NAME, APP_RELEASE_LABEL, APP_VERSION, DEFAULT_SETTINGS, AppPaths, save_settings
 from .database import Database, utcnow
 from .file_service import file_mime, safe_unlink, save_stream_to_controlled_path
 from .parser import parse_school_filename
@@ -86,6 +86,10 @@ def create_app(state: AppState) -> FastAPI:
     async def frontend_index():
         return FileResponse(state.paths.frontend / "index.html")
 
+    @app.get("/quick")
+    async def quick_index():
+        return FileResponse(state.paths.frontend / "quick" / "index.html")
+
     @app.get("/api/health")
     def health():
         return {"ok": True, "name": APP_NAME, "version": APP_VERSION, "device_uuid": state.identity["device_uuid"]}
@@ -96,6 +100,7 @@ def create_app(state: AppState) -> FastAPI:
         return {
             "name": APP_NAME,
             "version": APP_VERSION,
+            "release_label": APP_RELEASE_LABEL,
             "distribution": state.distribution,
             "distribution_label": labels.get(state.distribution, state.distribution),
             "data_path": str(state.paths.root),

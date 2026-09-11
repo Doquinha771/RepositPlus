@@ -22,6 +22,8 @@ from reposit.backend.backups import export_reposit, import_reposit
 from reposit.backend.config import APP_NAME, APP_VERSION, AppPaths, load_identity, load_settings, save_settings
 from reposit.backend.database import Database
 from reposit.backend.note_export import EXPORT_FORMATS, safe_filename, write_note_export
+from reposit.quick import QuickManager, QuickStateStore
+from reposit.quick.win32 import enable_per_monitor_v2
 
 def _local_appdata_root() -> Path:
     """Return the writable Reposit+ root used by every Windows distribution.
@@ -139,10 +141,8 @@ class NativeBridge:
         self.paths = paths
         self.db = db
         self.main_window: Any = None
-        self.spotlight_window: Any = None
         self._main_maximized = False
         self._main_restore_rect: tuple[int, int, int, int] | None = None
-        self.on_spotlight_destroyed: Any = None
 
     @staticmethod
     def _dialog_type(kind: str):
@@ -227,48 +227,11 @@ class NativeBridge:
         if self.main_window:
             self.main_window.show()
 
-    def hide_spotlight(self) -> None:
-        """Destroy Quick instead of merely hiding its WebView2 renderer."""
-        window = self.spotlight_window
-        self.spotlight_window = None
-        if window:
-            try:
-                window.destroy()
-            except Exception:
-                pass
-        if callable(self.on_spotlight_destroyed):
-            try:
-                self.on_spotlight_destroyed()
-            except Exception:
-                pass
-
     def open_note(self, note_id: int) -> None:
+        """Open a note in Main only after the user explicitly asks from Quick."""
         if self.main_window:
             self.main_window.show()
             self.main_window.evaluate_js(f"window.RepositUI && window.RepositUI.openNote({int(note_id)})")
-        if self.spotlight_window:
-            self.hide_spotlight()
-
-    def create_note_from_search(self, title: str) -> None:
-        if self.main_window:
-            self.main_window.show()
-            payload = json.dumps({"title": str(title)[:220]}, ensure_ascii=False)
-            self.main_window.evaluate_js(f"window.RepositUI && window.RepositUI.createNoteFromOverlay({payload})")
-        if self.spotlight_window:
-            self.hide_spotlight()
-
-    def run_command(self, command_id: str, raw: str = "") -> None:
-        if self.main_window:
-            self.main_window.show()
-            c = json.dumps(str(command_id), ensure_ascii=False)
-            r = json.dumps(str(raw), ensure_ascii=False)
-            self.main_window.evaluate_js(f"window.RepositUI && window.RepositUI.runCommand({c},{r})")
-        if self.spotlight_window:
-            self.hide_spotlight()
-
-
-
-
 
     def export_note(self, note_id: int, fmt: str = "pdf") -> dict[str, Any]:
         try:
@@ -315,10 +278,7 @@ class NativeBridge:
             self.export_backup,
             self.import_backup,
             self.show_main,
-            self.hide_spotlight,
             self.open_note,
-            self.create_note_from_search,
-            self.run_command,
             self.export_note,
         )
 
@@ -435,16 +395,14 @@ class DesktopRuntime:
         self.app = create_app(self.state)
         self.server: uvicorn.Server | None = None
         self.bridge = NativeBridge(PATHS, self.db)
-        self.bridge.on_spotlight_destroyed = self._on_spotlight_destroyed
+        self.quick = QuickManager(QuickStateStore(PATHS.data / "quick-state.json"))
         self.main_window = None
-        self.spotlight_window = None
+        self.quick_window = None
         self.force_exit = False
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
         self._keyboard = None
         self._webview_stopped = threading.Event()
-        self._gui_ready = threading.Event()
-        self._spotlight_lock = threading.Lock()
         self.base_url = ""
         self.memory_governor = WindowsMemoryGovernor(
             int(self.settings.get("memory_soft_limit_mb") or 192)
@@ -462,17 +420,6 @@ class DesktopRuntime:
                 save_settings(PATHS, self.settings)
             except Exception:
                 logging.getLogger("reposit.runtime").warning("Falha na manutenção periódica do banco.", exc_info=True)
-
-    def _on_spotlight_destroyed(self) -> None:
-        self.spotlight_window = None
-        self.bridge.spotlight_window = None
-        def trim_after_close():
-            time.sleep(0.15)
-            try:
-                self.memory_governor.trim_if_needed(force=True)
-            except Exception:
-                pass
-        threading.Thread(target=trim_after_close, name="reposit-quick-trim", daemon=True).start()
 
     def start_server(self) -> None:
         config = uvicorn.Config(
@@ -503,124 +450,46 @@ class DesktopRuntime:
             self._keyboard = keyboard
             self._hotkey_last = 0.0
 
-            def maybe_open(_event=None):
+            def maybe_toggle(_event=None):
                 try:
                     if not (keyboard.is_pressed("left ctrl") and keyboard.is_pressed("left alt")):
                         return
                     now = time.monotonic()
-                    if now - self._hotkey_last < 0.75:
+                    # Both modifier hooks may fire for the same press. Keep only a tiny
+                    # dedupe window so intentional rapid toggles still work.
+                    if now - self._hotkey_last < 0.18:
                         return
                     self._hotkey_last = now
                     self.log.info("Atalho global acionado: left ctrl + left alt")
-                    threading.Thread(target=self.show_spotlight, name="reposit-hotkey-open", daemon=True).start()
+                    self.toggle_quick()
                 except Exception as exc:
                     self.log.warning("Falha ao processar atalho global: %s", exc)
 
-            keyboard.on_press_key("left alt", maybe_open, suppress=False)
-            keyboard.on_press_key("left ctrl", maybe_open, suppress=False)
-
-            # Fechar o Quick não pode depender do foco do WebView. O listener nativo
-            # continua funcionando mesmo quando o Chromium decide brincar de esconde-esconde.
-            def hide_quick_on_escape(_event=None):
-                try:
-                    if self.spotlight_window:
-                        self.bridge.hide_spotlight()
-                except Exception as exc:
-                    self.log.debug("Falha ao fechar Quick com Esc: %s", exc)
-
-            keyboard.on_press_key("esc", hide_quick_on_escape, suppress=False)
-            # Modifier-only shortcuts are inherently temperamental on Windows.
-            # Keep Ctrl+Alt as requested and add Ctrl+Alt+Space as a reliable fallback.
-            keyboard.add_hotkey("ctrl+alt+space", lambda: threading.Thread(target=self.show_spotlight, name="reposit-hotkey-fallback", daemon=True).start(), suppress=False, trigger_on_release=False)
+            keyboard.on_press_key("left alt", maybe_toggle, suppress=False)
+            keyboard.on_press_key("left ctrl", maybe_toggle, suppress=False)
+            keyboard.add_hotkey(
+                "ctrl+alt+space",
+                self.show_quick,
+                suppress=False,
+                trigger_on_release=False,
+            )
             self.log.info("Atalho global registrado: left ctrl + left alt; fallback ctrl+alt+space")
         except Exception as exc:
             self.log.warning("Atalho global indisponível: %s", exc)
 
-    def _ensure_spotlight_window(self):
-        if self.spotlight_window:
-            return self.spotlight_window
-        if not self._gui_ready.wait(3.0):
-            return None
-        with self._spotlight_lock:
-            if self.spotlight_window:
-                return self.spotlight_window
-            window = webview.create_window(
-                "Reposit+ Quick",
-                f"{self.base_url}/?overlay=1",
-                width=720,
-                height=410,
-                min_size=(620, 180),
-                frameless=True,
-                on_top=False,
-                hidden=True,
-                resizable=False,
-                easy_drag=False,
-                shadow=False,
-                transparent=False,
-                background_color="#242629",
-            )
-            if window:
-                window.expose(*self.bridge.exposed_functions())
-                self.spotlight_window = window
-                self.bridge.spotlight_window = window
-            return self.spotlight_window
-
-    def show_spotlight(self) -> None:
+    def toggle_quick(self) -> None:
         try:
-            if not self._ensure_spotlight_window():
-                return
-            if os.name == "nt":
-                try:
-                    import ctypes
-                    user32 = ctypes.windll.user32
-                    sw = int(user32.GetSystemMetrics(0))
-                    sh = int(user32.GetSystemMetrics(1))
-                    self.spotlight_window.move(max(0, (sw - 720) // 2), max(40, int(sh * 0.16)))
-                except Exception:
-                    pass
-            self.spotlight_window.show()
-
-            def focus_after_show():
-                time.sleep(0.08)
-                try:
-                    if os.name == "nt":
-                        import ctypes
-                        user32 = ctypes.windll.user32
-                        hwnd = user32.FindWindowW(None, "Reposit+ Quick")
-                        if hwnd:
-                            HWND_TOP = 0
-                            SWP_NOMOVE = 0x0002
-                            SWP_NOSIZE = 0x0001
-                            SW_SHOW = 5
-                            # Keep Quick opaque and borderless. Chroma-key transparency produced
-                            # dark/gray halos around WebView2 on some Windows builds. Ask DWM for
-                            # rounded corners instead and paint the whole native window the panel color.
-                            try:
-                                dwmapi = ctypes.windll.dwmapi
-                                preference = ctypes.c_int(2)  # DWMWCP_ROUND
-                                dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(preference), ctypes.sizeof(preference))
-                            except Exception:
-                                pass
-                            user32.ShowWindow(hwnd, SW_SHOW)
-                            user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
-                            user32.BringWindowToTop(hwnd)
-                            user32.SetForegroundWindow(hwnd)
-                    # WebView2 can steal focus for a few frames after ShowWindow. Re-assert
-                    # the input focus a few times so Quick always opens ready for typing.
-                    for delay in (0.0, 0.08, 0.18, 0.34):
-                        if delay:
-                            time.sleep(delay)
-                        self.spotlight_window.evaluate_js("window.RepositUI && window.RepositUI.focusSpotlight && window.RepositUI.focusSpotlight()")
-                    self.log.info("Reposit+ Quick exibido pelo atalho global")
-                except Exception as exc:
-                    self.log.warning("Falha ao focar Reposit+ Quick: %s", exc)
-
-            threading.Thread(target=focus_after_show, name="reposit-quick-focus", daemon=True).start()
+            self.quick.toggle()
         except Exception as exc:
-            self.log.warning("Falha ao abrir busca global: %s", exc)
+            self.log.warning("Falha ao alternar Reposit+ Quick: %s", exc)
+
+    def show_quick(self) -> None:
+        try:
+            self.quick.show()
+        except Exception as exc:
+            self.log.warning("Falha ao abrir Reposit+ Quick: %s", exc)
 
     def on_main_loaded(self):
-        self._gui_ready.set()
         self.log.info("Interface HTML carregada pelo pywebview")
 
     def shutdown_runtime(self) -> None:
@@ -661,8 +530,8 @@ class DesktopRuntime:
         # pywebview only terminates after all windows are gone. The hidden Quick
         # window counts, because apparently invisible windows still have opinions.
         try:
-            if self.spotlight_window:
-                self.spotlight_window.destroy()
+            if self.quick_window:
+                self.quick_window.destroy()
         except Exception:
             pass
         self.shutdown_runtime()
@@ -675,6 +544,7 @@ class DesktopRuntime:
         return True
 
     def run(self) -> None:
+        enable_per_monitor_v2()
         enable_windows_energy_saver(bool(self.settings.get("battery_saver")))
         self.log.info("Iniciando %s %s (%s)", APP_NAME, APP_VERSION, "portable" if PORTABLE_MODE else "installed/source")
         if os.name == "nt":
@@ -710,6 +580,27 @@ class DesktopRuntime:
         exposed = self.bridge.exposed_functions()
         self.main_window.expose(*exposed)
 
+        # Quick is created once and kept hidden. Toggling never recreates its HWND,
+        # WebView2 renderer, listeners or JS state. It is fully independent from Main.
+        self.quick_window = webview.create_window(
+            self.quick.title,
+            f"{self.base_url}/quick",
+            width=self.quick.WINDOW_SIZE[0],
+            height=self.quick.WINDOW_SIZE[1],
+            min_size=self.quick.WINDOW_SIZE,
+            frameless=True,
+            on_top=False,
+            hidden=True,
+            resizable=False,
+            easy_drag=False,
+            shadow=True,
+            transparent=False,
+            background_color="#111312",
+        )
+        self.quick.bind_window(self.quick_window)
+        self.quick.bind_open_note(self.bridge.open_note)
+        self.quick_window.expose(*self.quick.exposed_functions())
+        self.quick_window.events.loaded += self.quick.mark_ready
         self.main_window.events.closing += self.on_closing
         self.main_window.events.loaded += self.on_main_loaded
         self.register_hotkey()
@@ -744,6 +635,9 @@ def run_self_test() -> int:
             PATHS.frontend / "index.html",
             PATHS.frontend / "css" / "main.css",
             PATHS.frontend / "js" / "app.js",
+            PATHS.frontend / "quick" / "index.html",
+            PATHS.frontend / "quick" / "quick.css",
+            PATHS.frontend / "quick" / "quick.js",
         ]
         if not all(path.is_file() for path in required):
             return 2

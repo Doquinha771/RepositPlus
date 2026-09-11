@@ -49,7 +49,7 @@ const state = {
   sidebarCollapsed: localStorage.getItem('reposit.sidebar.collapsed')==='1', settingsTab:'general',
   settings:{autosave_enabled:true,battery_saver:false,memory_soft_limit_mb:192},
   appInfo:{name:'Reposit+',version:'0.7.0',distribution:'source',distribution_label:'Código-fonte',data_path:''},
-  query:'', kind:'', tag:'', noteTags:[], period:'all', view:'table', ecoMode:false, noteDirty:false, storage:null, overlay:new URLSearchParams(location.search).get('overlay')==='1'
+  query:'', kind:'', tag:'', noteTags:[], period:'all', view:'table', ecoMode:false, noteDirty:false, storage:null
 };
 let saveTimer = null;
 let searchTimer = null;
@@ -198,7 +198,6 @@ async function configureNotebookMode(){
 function showFirstRunWelcome(){}
 async function init(){
   await configureNotebookMode();
-  if(state.overlay){ document.body.classList.add('overlay'); return initOverlay(); }
   applyUiPreferences(); renderShell(); bindGlobal(); await navigate('workspace');
   const results=await Promise.allSettled([get('/api/settings'),get('/api/storage?details=false')]);
   if(results[0].status==='fulfilled')state.settings=results[0].value;
@@ -788,19 +787,6 @@ function bindSettingsAutosave(){
   $('#import-backup')?.addEventListener('click',async()=>{try{const r=await window.pywebview?.api?.import_backup();if(r?.ok)toast('Backup importado. Reinicie o app.','ok');else if(r?.error)toast(r.error,'err');}catch(err){toast(err.message,'err');}});
 }
 
-async function initOverlay(){
-  $('#app').innerHTML=`<div class="overlay-shell"><div class="quick-box"><div class="quick-brand"><img class="quick-app-icon" src="/static/assets/RepositPlus.png" alt=""><strong>REPOSIT+</strong><span>QUICK</span></div><div class="quick-input">${icon('search')}<input id="quick-query" placeholder="Pesquisar ou criar no Reposit+" autocomplete="off"><span class="quick-hint">Esc</span></div><div id="quick-results" class="quick-results"></div><div class="quick-footer"><span>Enter abre</span><span>Ctrl + Alt abre em qualquer lugar</span></div></div></div>`;
-  const input=$('#quick-query');let cursor=0,items=[];
-  async function refresh(){const q=input.value.trim();if(!q){items=(await get('/api/notes?limit=6')).slice(0,6);}else if(q.startsWith('>')){items=[{command:'new',title:'Criar nova anotação',kind:'Comando'}].filter(x=>x.title.toLowerCase().includes(q.slice(1).trim().toLowerCase())||!q.slice(1).trim());}else{items=(await get(`/api/notes?q=${encodeURIComponent(q)}&limit=7`)).slice(0,7);}cursor=0;render();}
-  function render(){const q=input.value.trim();const rows=items.map((n,i)=>`<div class="quick-row ${i===cursor?'active':''}" data-quick="${i}"><span class="quick-row-icon">${icon(n.command?'bolt':'document')}</span><div class="grow"><strong>${esc(n.title)}</strong><small>${esc(n.kind||'Anotação')}${n.tags?` • ${esc(n.tags)}`:''}</small></div><span>${icon('angle-right')}</span></div>`).join('');const create=!q.startsWith('>')&&q?`<div class="quick-row create ${items.length===cursor?'active':''}" data-create><span class="quick-row-icon">${icon('plus')}</span><div class="grow"><strong>Criar “${esc(q)}”</strong><small>Nova anotação</small></div></div>`:'';$('#quick-results').innerHTML=rows+create;$$('[data-quick]').forEach(el=>el.onclick=()=>activate(Number(el.dataset.quick)));$('[data-create]')?.addEventListener('click',()=>createFromQuery());}
-  async function activate(i){const n=items[i];if(!n)return;if(n.command){if(n.command==='new')return createFromQuery('Nova anotação');if(window.pywebview?.api?.run_command)return window.pywebview.api.run_command('settings','');}if(window.pywebview?.api?.open_note)await window.pywebview.api.open_note(n.id);}
-  async function createFromQuery(title=input.value.trim()||'Nova anotação'){if(window.pywebview?.api?.create_note_from_search)await window.pywebview.api.create_note_from_search(title);}
-  const closeQuick=()=>window.pywebview?.api?.hide_spotlight?.();
-  document.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();closeQuick();}});
-  input.oninput=()=>refresh();input.onkeydown=e=>{if(e.key==='Escape'){closeQuick();}if(e.key==='ArrowDown'){e.preventDefault();cursor=Math.min(cursor+1,items.length+(input.value.trim()&&!input.value.trim().startsWith('>')?0:-1));render();}if(e.key==='ArrowUp'){e.preventDefault();cursor=Math.max(0,cursor-1);render();}if(e.key==='Enter'){e.preventDefault();if(cursor<items.length)activate(cursor);else createFromQuery();}};
-  window.RepositUI={focusSpotlight:()=>{input.value='';refresh();setTimeout(()=>input.focus(),30);}};await refresh();setTimeout(()=>input.focus(),50);
-}
-
 window.addEventListener('beforeunload',event=>{if(state.noteDirty&&!state.settings.autosave_enabled){event.preventDefault();event.returnValue='';}});
 window.addEventListener('error', event => {
   console.error('Reposit+ frontend error:', event.error || event.message);
@@ -814,10 +800,8 @@ window.addEventListener('unhandledrejection', event => {
 });
 
 window.RepositUI={
-  openNote: async id=>{if(state.overlay)return;await navigate('workspace');await openNote(id);},
-  createNoteFromOverlay: async payload=>{if(state.overlay)return;await navigate('workspace');await createBlankNote(payload||{},true);},
+  openNote: async id=>{await navigate('workspace');await openNote(id);},
   createBlankNote: ()=>createBlankNote({},false),
-  focusSpotlight: ()=>$('#quick-query')?.focus(),
   refreshSettings: async()=>{state.settings=await get('/api/settings');applyUiPreferences();},
   runCommand: async id=>{
     if(id==='new-note') return createBlankNote({},false);

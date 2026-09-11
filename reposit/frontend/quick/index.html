@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Reposit+ Quick</title>
+  <link rel="stylesheet" href="/static/quick/quick.css?v=071pre1b">
+</head>
+<body>
+  <main class="quick-shell" aria-label="Reposit+ Quick">
+    <header class="window-head">
+      <div class="window-title">
+        <img src="/static/assets/RepositPlus.png" alt="">
+        <span>Quick</span>
+      </div>
+      <button id="close" class="traffic-close" type="button" aria-label="Fechar Quick" title="Fechar"></button>
+    </header>
+
+    <section class="finder" aria-label="Buscar ou criar nota">
+      <div class="search-box">
+        <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m21 21-4.35-4.35m2.35-5.15A7.5 7.5 0 1 1 4 11.5a7.5 7.5 0 0 1 15 0Z"/>
+        </svg>
+        <input id="search" autocomplete="off" spellcheck="false" maxlength="220" placeholder="Buscar ou criar uma nota..." aria-label="Buscar ou criar uma nota">
+        <kbd>esc</kbd>
+      </div>
+
+      <div class="result-head">
+        <span id="result-label">Notas recentes</span>
+        <span class="key-hint">↑↓ navegar · enter abrir</span>
+      </div>
+
+      <div id="results" class="results" role="listbox" aria-label="Notas"></div>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+    </section>
+
+    <footer class="quick-footer">
+      <span>Reposit+</span>
+      <span>Digite para pesquisar. Se não existir, crie uma nova nota.</span>
+    </footer>
+  </main>
+  <script src="/static/quick/quick.js?v=071pre1b"></script>
+</body>
+</html>
