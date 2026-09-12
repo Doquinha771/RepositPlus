@@ -258,18 +258,66 @@ def create_app(state: AppState) -> FastAPI:
     def patch_note(note_id: int, payload: dict[str, Any]):
         allowed = {"title", "kind", "content", "tags", "pinned", "content_format", "parent_note_id"}
         updates = {k: payload[k] for k in allowed if k in payload}
-        if not state.db.fetchone("SELECT id FROM notes WHERE id=?", (note_id,)):
-            raise HTTPException(404, "Anotação não encontrada.")
+        raw_revision = payload.get("save_revision", None)
+        save_revision: int | None = None
+        if raw_revision is not None:
+            try:
+                save_revision = max(0, int(raw_revision))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Revisão de salvamento inválida.")
+
+        with state.db.session() as conn:
+            # Revisioned editor saves are serialized at the SQLite write boundary.
+            # Without this, two DEFERRED transactions can both read the same
+            # edit_revision and make the newer request fail spuriously after the
+            # older one commits. BEGIN IMMEDIATE makes the read/compare/update a
+            # single ordered critical section while keeping non-editor PATCHes
+            # on the normal lightweight path.
+            if save_revision is not None:
+                conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id,edit_revision FROM notes WHERE id=?", (note_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "Anotação não encontrada.")
+            current_revision = int(row["edit_revision"] or 0)
+
+            # A repeated request for a revision that already committed is idempotent.
+            # A genuinely older revision is rejected, so a delayed PATCH can never
+            # overwrite newer editor content.
+            if save_revision is not None:
+                if save_revision < current_revision:
+                    raise HTTPException(409, detail={
+                        "message": "Uma revisão mais nova desta anotação já foi salva.",
+                        "current_revision": current_revision,
+                    })
+                if save_revision == current_revision:
+                    return _note_full(state, note_id)
+
+            if updates:
+                normalized: dict[str, Any] = {}
+                for k, v in updates.items():
+                    if k == "pinned": normalized[k] = int(bool(v))
+                    elif k == "parent_note_id": normalized[k] = int(v) if v not in (None, "") else None
+                    elif k == "content_format": normalized[k] = "html" if str(v) == "html" else "plain"
+                    else: normalized[k] = str(v)[:120000 if k == "content" else 50000]
+                normalized["updated_at"] = utcnow()
+                if save_revision is not None:
+                    normalized["edit_revision"] = save_revision
+                sets = ",".join(f"{k}=?" for k in normalized)
+                params = [*normalized.values(), note_id]
+                sql = f"UPDATE notes SET {sets} WHERE id=?"
+                if save_revision is not None:
+                    sql += " AND edit_revision=?"
+                    params.append(current_revision)
+                cur = conn.execute(sql, tuple(params))
+                if save_revision is not None and cur.rowcount != 1:
+                    latest = conn.execute("SELECT edit_revision FROM notes WHERE id=?", (note_id,)).fetchone()
+                    latest_revision = int(latest["edit_revision"] or 0) if latest else current_revision
+                    raise HTTPException(409, detail={
+                        "message": "O conteúdo mudou enquanto esta revisão era salva.",
+                        "current_revision": latest_revision,
+                    })
+
         if updates:
-            normalized: dict[str, Any] = {}
-            for k, v in updates.items():
-                if k == "pinned": normalized[k] = int(bool(v))
-                elif k == "parent_note_id": normalized[k] = int(v) if v not in (None, "") else None
-                elif k == "content_format": normalized[k] = "html" if str(v) == "html" else "plain"
-                else: normalized[k] = str(v)[:120000 if k == "content" else 50000]
-            normalized["updated_at"] = utcnow()
-            sets = ",".join(f"{k}=?" for k in normalized)
-            state.db.execute(f"UPDATE notes SET {sets} WHERE id=?", [*normalized.values(), note_id])
             _rebuild_note_fts(state.db, note_id)
         return _note_full(state, note_id)
 

@@ -6,10 +6,17 @@
   const results = $('#results');
   const resultLabel = $('#result-label');
   const status = $('#status');
+  const focusSearch = (selectContent = false) => {
+    if (!search) return;
+    try { search.focus({preventScroll: true}); }
+    catch (_) { search.focus(); }
+    // Select only before the native reveal. Repeated Windows/WebView focus
+    // events must never re-select text after the user has started typing.
+    if (selectContent && document.activeElement === search) search.select();
+  };
 
   let items = [];
   let selectedIndex = 0;
-  let searchTimer = null;
   let stateTimer = null;
   let requestToken = 0;
   let initialized = false;
@@ -91,10 +98,9 @@
     if (item.type === 'create') {
       return `
         <button class="result-row create${selected}" type="button" role="option" aria-selected="${index === selectedIndex}" data-index="${index}">
-          <span class="result-icon">＋</span>
+          <span class="result-icon create-icon" aria-hidden="true">＋</span>
           <span class="result-copy">
             <strong>Criar “${escapeHtml(item.title)}”</strong>
-            <span>Cria uma nova nota e abre no Reposit+</span>
           </span>
           <span class="result-meta">enter</span>
         </button>`;
@@ -103,7 +109,13 @@
     const preview = plain(item.content) || 'Nota sem conteúdo';
     return `
       <button class="result-row${selected}" type="button" role="option" aria-selected="${index === selectedIndex}" data-index="${index}">
-        <span class="result-icon">⌘</span>
+        <span class="result-icon note-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false">
+            <path class="page-back" d="M7.5 4.75h7.8a2 2 0 0 1 2 2v9.6"/>
+            <rect x="4.75" y="7.25" width="11.5" height="12" rx="2"/>
+            <path d="M8 11h5M8 14h5M8 17h3.5"/>
+          </svg>
+        </span>
         <span class="result-copy">
           <strong>${escapeHtml(item.title || 'Sem título')}</strong>
           <span>${escapeHtml(preview.slice(0, 105))}</span>
@@ -209,8 +221,9 @@
 
     search.addEventListener('input', () => {
       persistQuery();
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => load(search.value), 150);
+      // Local API search is dispatched immediately. requestToken already drops
+      // stale responses, so there is no reason to make typing wait for debounce.
+      load(search.value);
     });
 
     search.addEventListener('keydown', (event) => {
@@ -248,16 +261,22 @@
   };
 
   window.RepositQuick = {
+    prepareShow: () => focusSearch(true),
     onShown: () => {
-      setTimeout(() => {
-        search.focus();
-        search.select();
-      }, 0);
+      focusSearch(false);
       load(search.value);
     },
     beforeHide: () => flushState()
   };
 
+  // Native activation and WebView focus do not always arrive in the same event
+  // on Windows. Re-focus only on real activation/visibility events, never by
+  // polling or a repeating timer. This makes the global shortcut type-ready.
+  window.addEventListener('focus', focusSearch);
+  window.addEventListener('pageshow', focusSearch);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) focusSearch();
+  });
   window.addEventListener('pywebviewready', init);
-  window.addEventListener('DOMContentLoaded', () => setTimeout(init, 120));
+  window.addEventListener('DOMContentLoaded', init);
 })();

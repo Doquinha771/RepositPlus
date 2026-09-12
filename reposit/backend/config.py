@@ -9,7 +9,7 @@ from typing import Any
 
 APP_NAME = "Reposit+"
 APP_VERSION = "0.7.1"
-APP_RELEASE_LABEL = "0.7.1 Pré-1"
+APP_RELEASE_LABEL = "0.7.1 Stable"
 INTERNAL_NAME = "reposit-plus"
 DB_NAME = "REPOSITINFOS.db"
 

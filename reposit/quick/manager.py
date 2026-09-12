@@ -10,10 +10,11 @@ from .win32 import QuickWin32
 
 
 class QuickManager:
-    """Owns the single persistent Quick window.
+    """Own the single persistent Quick window.
 
-    The Quick has one visual state only: open. It behaves like a compact desktop
-    finder, so there is no collapsed/expanded lifecycle to coordinate anymore.
+    The WebView is created once at application startup and only becomes visible
+    after its document has finished loading. This prevents the native host from
+    exposing an unpainted WebView2 surface as a black rectangle.
     """
 
     WINDOW_SIZE = (660, 430)
@@ -26,6 +27,7 @@ class QuickManager:
         self._win32 = QuickWin32(title)
         self._lock = threading.RLock()
         self._visible = False
+        self._pending_show = False
         self._ready = threading.Event()
         self._open_note_callback: Callable[[int], Any] | None = None
 
@@ -37,9 +39,34 @@ class QuickManager:
         self._open_note_callback = callback
 
     def mark_ready(self, *_args: Any) -> None:
-        self._ready.set()
-        if os.name == "nt":
-            self._win32.prepare_hidden()
+        """Mark the hidden WebView as paint-ready and honor an early hotkey."""
+        with self._lock:
+            self._ready.set()
+            if self._pending_show:
+                self._pending_show = False
+                self._show_ready_locked()
+            elif os.name == "nt":
+                self._win32.prepare_hidden()
+
+    def _evaluate(self, script: str) -> None:
+        if not self.window or not self._ready.is_set():
+            return
+        try:
+            self.window.evaluate_js(script)
+        except Exception:
+            pass
+
+    def _prepare_dom_for_show(self) -> None:
+        # Ask the already-loaded page to place DOM focus on the input before the
+        # native window is promoted. onShown repeats this after activation.
+        self._evaluate(
+            "window.RepositQuick && window.RepositQuick.prepareShow && window.RepositQuick.prepareShow()"
+        )
+
+    def _notify_shown(self) -> None:
+        self._evaluate(
+            "window.RepositQuick && window.RepositQuick.onShown && window.RepositQuick.onShown()"
+        )
 
     def is_visible(self) -> bool:
         with self._lock:
@@ -49,7 +76,7 @@ class QuickManager:
 
     def toggle(self) -> bool:
         with self._lock:
-            if self._visible or (os.name == "nt" and self._win32.is_visible()):
+            if self._pending_show or self._visible or (os.name == "nt" and self._win32.is_visible()):
                 self.hide()
                 return False
             return self.show()
@@ -58,44 +85,55 @@ class QuickManager:
         with self._lock:
             if not self.window:
                 return False
-            width, height = self.WINDOW_SIZE
-            if os.name == "nt":
-                self._win32.prepare_show()
+            # A hidden WebView2 can exist before its first painted frame. Never
+            # reveal it until pywebview reports the page as loaded.
+            if not self._ready.is_set():
+                self._pending_show = True
+                return True
+            return self._show_ready_locked()
+
+    def _show_ready_locked(self) -> bool:
+        if not self.window:
+            return False
+
+        width, height = self.WINDOW_SIZE
+        self._prepare_dom_for_show()
+        native_ok = False
+
+        if os.name == "nt":
+            self._win32.prepare_show()
+            native_ok = self._win32.show(width, height)
+            if not native_ok:
+                try:
+                    self.window.show()
+                    self.window.resize(width, height)
+                except Exception as exc:
+                    self.log.warning("Quick: pywebview não conseguiu mostrar a janela: %s", exc)
+                    return False
+        else:
             try:
                 self.window.show()
+                self.window.resize(width, height)
             except Exception as exc:
                 self.log.warning("Quick: pywebview não conseguiu mostrar a janela: %s", exc)
                 return False
 
-            native_ok = False
-            if os.name == "nt":
-                native_ok = self._win32.show(width, height)
-            else:
-                try:
-                    self.window.resize(width, height)
-                except Exception:
-                    pass
-            self._visible = True
-            try:
-                self.window.evaluate_js(
-                    "window.RepositQuick && window.RepositQuick.onShown && window.RepositQuick.onShown()"
-                )
-            except Exception:
-                pass
-            if os.name == "nt" and not native_ok:
-                self.log.warning("Quick abriu pelo pywebview, mas a promoção Win32 falhou; mantendo fallback seguro.")
-            return True
+        self._visible = True
+        # Win32 show() no longer blocks for the slide animation, so DOM focus is
+        # restored immediately and the user can type while the window settles.
+        self._notify_shown()
+        if os.name == "nt" and not native_ok:
+            self.log.warning("Quick abriu pelo pywebview, mas a promoção Win32 falhou; mantendo fallback seguro.")
+        return True
 
     def hide(self) -> bool:
         with self._lock:
+            self._pending_show = False
             if not self.window:
                 return False
-            try:
-                self.window.evaluate_js(
-                    "window.RepositQuick && window.RepositQuick.beforeHide && window.RepositQuick.beforeHide()"
-                )
-            except Exception:
-                pass
+            self._evaluate(
+                "window.RepositQuick && window.RepositQuick.beforeHide && window.RepositQuick.beforeHide()"
+            )
             if os.name == "nt":
                 self._win32.hide()
             try:

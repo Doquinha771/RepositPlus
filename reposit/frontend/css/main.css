@@ -683,3 +683,15 @@ html.eco-mode *,html.eco-mode *::before,html.eco-mode *::after{animation-duratio
 @media(max-width:900px){.context-submenu{position:fixed;left:12px!important;right:12px!important;top:auto!important;bottom:58px;width:auto}.export-format-grid{grid-template-columns:1fr}.notion-top-actions #notion-pin{display:none}}
 /* 'Todas as notas' is a real primary filter instead of an anonymous pill. */
 .period-tabs-large .period-all{padding-inline:11px 12px!important;gap:7px!important;min-width:126px!important;font-weight:800!important}.period-tabs-large .period-all .rp-icon{width:15px!important;height:15px!important}.period-tabs-large .period-all b{min-width:20px;height:19px;padding:0 5px;border-radius:999px;display:inline-grid;place-items:center;background:var(--surface-3);color:var(--muted);font-size:9px}.period-tabs-large .period-all.active b{background:color-mix(in srgb,var(--accent) 22%,var(--surface));color:var(--accent)}.note-tab-home{min-width:78px!important;padding-inline:10px!important;gap:6px!important}.note-tab-home span{font-size:10px;font-weight:750}
+
+/* 0.7.1 Pré-2/Pré-3: explicit save state + in-note find bar. */
+.save-retry{border:0;background:transparent;color:var(--apricot);font:inherit;font-size:11px;font-weight:700;cursor:pointer;padding:5px 8px;border-radius:7px}
+.save-retry:hover{background:var(--surface-2)}
+.autosave-state{white-space:nowrap}
+.note-dirty .autosave-state{color:var(--apricot)!important}
+.note-findbar{position:absolute;z-index:40;top:78px;right:30px;display:flex;align-items:center;gap:6px;padding:7px;border:1px solid var(--line);border-radius:10px;background:var(--surface);box-shadow:0 16px 42px rgba(0,0,0,.36)}
+.note-findbar input{width:220px;height:32px;border:1px solid var(--line);border-radius:7px;background:var(--surface-2);color:var(--text);outline:0;padding:0 9px}
+.note-findbar input:focus{border-color:var(--accent)}
+.note-findbar .note-find-result{min-width:72px;color:var(--muted);font-size:11px;text-align:center}
+.note-findbar button{width:30px;height:30px;border:0;border-radius:6px;background:transparent;color:var(--text-soft);cursor:pointer}
+.note-findbar button:hover{background:var(--surface-2);color:var(--text)}

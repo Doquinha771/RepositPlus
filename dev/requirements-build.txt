@@ -1,0 +1,4 @@
+-r requirements-runtime.txt
+pytest==8.4.1
+pyinstaller==6.15.0
+httpx==0.28.1

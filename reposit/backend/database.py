@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def utcnow() -> str:
@@ -51,6 +51,7 @@ class Database:
             self._migration_3(conn)
             self._migration_4(conn)
             self._migration_5(conn)
+            self._migration_6(conn)
             conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
             conn.commit()
         finally:
@@ -220,6 +221,9 @@ class Database:
             if version < 5:
                 self._migration_5(conn)
                 version = 5
+            if version < 6:
+                self._migration_6(conn)
+                version = 6
             conn.execute(f"PRAGMA user_version={version}")
 
     def _migration_1(self, conn: sqlite3.Connection) -> None:
@@ -367,6 +371,7 @@ class Database:
                 content TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
                 pinned INTEGER NOT NULL DEFAULT 0,
+                edit_revision INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -443,6 +448,13 @@ class Database:
                     ALTER TABLE teachers_v5 RENAME TO teachers;
                 """)
         conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migration_6(self, conn: sqlite3.Connection) -> None:
+        """0.7.1 Pré-2: monotonic editor revisions used by conflict-safe autosave."""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+        if "edit_revision" not in columns:
+            conn.execute("ALTER TABLE notes ADD COLUMN edit_revision INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_revision ON notes(id, edit_revision)")
 
     def maintenance(self, force: bool = False) -> dict[str, Any]:
         """Run cheap SQLite upkeep. VACUUM is reserved for explicit/large cleanup."""

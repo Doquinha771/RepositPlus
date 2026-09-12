@@ -1,0 +1,2 @@
+# Ferramenta opcional de desenvolvimento. Não entra no runtime/release.
+psutil>=6.1,<8

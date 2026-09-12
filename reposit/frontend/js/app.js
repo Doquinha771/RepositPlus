@@ -48,11 +48,106 @@ const state = {
   route:'workspace', notes:[], active:null, selected:new Set(), openTabs:[],
   sidebarCollapsed: localStorage.getItem('reposit.sidebar.collapsed')==='1', settingsTab:'general',
   settings:{autosave_enabled:true,battery_saver:false,memory_soft_limit_mb:192},
-  appInfo:{name:'Reposit+',version:'0.7.0',distribution:'source',distribution_label:'Código-fonte',data_path:''},
+  appInfo:{name:'Reposit+',version:'0.7.1',distribution:'source',distribution_label:'Código-fonte',data_path:''},
   query:'', kind:'', tag:'', noteTags:[], period:'all', view:'table', ecoMode:false, noteDirty:false, storage:null
 };
-let saveTimer = null;
-let searchTimer = null;
+const NOTE_DRAFT_PREFIX='reposit.note-draft.';
+const noteSessions=new Map();
+let searchTimer=null;
+let openNoteRequestSeq=0;
+let pendingAttachmentNoteId=null;
+let forcePlainPasteOnce=false;
+
+class SelectionManager {
+  constructor(){this.ranges=new Map();}
+  remember(noteId=state.active?.id){
+    const editor=$('#notion-content'),sel=window.getSelection();
+    const id=Number(noteId||0);
+    if(!id||!editor||!sel?.rangeCount||!editor.contains(sel.anchorNode))return false;
+    this.ranges.set(id,sel.getRangeAt(0).cloneRange());
+    return true;
+  }
+  restore(noteId=state.active?.id){
+    const editor=$('#notion-content'),id=Number(noteId||0),range=this.ranges.get(id);
+    if(!editor)return false;
+    editor.focus({preventScroll:true});
+    if(!range||!range.startContainer?.isConnected||!editor.contains(range.startContainer))return false;
+    const sel=window.getSelection();sel.removeAllRanges();sel.addRange(range.cloneRange());return true;
+  }
+  clear(noteId){this.ranges.delete(Number(noteId||0));}
+}
+const selectionManager=new SelectionManager();
+
+function noteDraftKey(id){return `${NOTE_DRAFT_PREFIX}${Number(id)}`;}
+function readNoteDraft(id){try{const raw=localStorage.getItem(noteDraftKey(id));return raw?JSON.parse(raw):null;}catch(_err){return null;}}
+function clearNoteDraft(id){try{localStorage.removeItem(noteDraftKey(id));}catch(_err){}}
+function persistNoteDraft(session){
+  if(!session?.dirty||!session.payload)return;
+  try{localStorage.setItem(noteDraftKey(session.id),JSON.stringify({saveRevision:session.saveRevision,payload:session.payload,updatedAt:Date.now()}));}
+  catch(_err){session.error='Não foi possível guardar o rascunho local.';}
+}
+function noteSession(id,note=null){
+  id=Number(id);if(!id)return null;
+  let session=noteSessions.get(id);
+  const serverRevision=Math.max(0,Number(note?.edit_revision||0));
+  if(!session){
+    const draft=readNoteDraft(id);
+    const draftRevision=Math.max(0,Number(draft?.saveRevision||0));
+    const useDraft=!!(draft?.payload&&draftRevision>serverRevision);
+    session={id,saveRevision:useDraft?draftRevision:serverRevision,savedRevision:serverRevision,payload:useDraft?draft.payload:null,dirty:useDraft,inFlight:null,timer:null,error:null,isComposing:false};
+    noteSessions.set(id,session);
+    if(!useDraft&&draft)clearNoteDraft(id);
+  }else if(note){
+    session.savedRevision=Math.max(session.savedRevision,serverRevision);
+    if(session.dirty&&session.saveRevision<=session.savedRevision)session.saveRevision=session.savedRevision+1;
+    if(!session.dirty){session.saveRevision=session.savedRevision;session.payload=null;clearNoteDraft(id);}
+  }
+  return session;
+}
+function hasPendingNoteChanges(){return [...noteSessions.values()].some(s=>s.dirty||s.inFlight);}
+function currentEditorPayload(){
+  return {title:$('#notion-title')?.value||'Sem título',kind:$('#notion-kind')?.value||'Anotação',tags:$('#notion-tags')?.value||'',content:serializeEditorContent($('#notion-content')),content_format:'html'};
+}
+function captureNoteRevision(id,{increment=false}={}){
+  id=Number(id);const session=noteSession(id,state.active?.id===id?state.active:null);if(!session)return null;
+  if(state.active?.id===id&&$('#notion-content'))session.payload=currentEditorPayload();
+  if(increment){session.saveRevision=Math.max(session.saveRevision,session.savedRevision)+1;session.dirty=true;}
+  if(session.dirty)persistNoteDraft(session);
+  syncSaveUi(id);return session;
+}
+function materializeSessionNote(note){
+  const session=noteSession(note?.id,note);
+  return session?.dirty&&session.payload?{...note,...session.payload,edit_revision:session.savedRevision}:note;
+}
+function syncSaveUi(id=state.active?.id){
+  id=Number(id||0);const session=id?noteSessions.get(id):null;
+  if(state.active?.id===id){
+    state.noteDirty=!!session?.dirty;
+    document.body.classList.toggle('note-dirty',state.noteDirty);
+    const status=$('#autosave-state'),retry=$('#save-retry');
+    if(status&&session){
+      if(session.inFlight)status.textContent='Salvando…';
+      else if(session.error&&session.dirty)status.textContent='Erro ao salvar';
+      else if(session.dirty)status.textContent='Alterações pendentes';
+      else status.textContent=state.settings.autosave_enabled?'Salvo':'Salvo · manual';
+    }
+    if(retry){retry.hidden=!(session?.error&&session?.dirty);retry.title=session?.error||'Tentar salvar novamente';}
+  }
+  renderNoteTabsDirtyOnly();
+}
+function renderNoteTabsDirtyOnly(){
+  $$('[data-tab-note]').forEach(tab=>tab.classList.toggle('dirty',!!noteSessions.get(Number(tab.dataset.tabNote))?.dirty));
+}
+function setDirty(value=true){
+  const id=state.active?.id;if(!id)return;const session=noteSession(id,state.active);
+  if(value){session.dirty=true;if(session.saveRevision<=session.savedRevision)session.saveRevision=session.savedRevision+1;persistNoteDraft(session);}
+  else if(session.savedRevision>=session.saveRevision){session.dirty=false;clearNoteDraft(id);}
+  syncSaveUi(id);
+}
+function scheduleNoteSave(id,delay=850){
+  const session=noteSession(id);if(!session)return;clearTimeout(session.timer);session.timer=null;syncSaveUi(id);
+  if(state.settings.autosave_enabled&&!session.isComposing&&session.dirty)session.timer=setTimeout(()=>{session.timer=null;void saveNotionPage(id,true);},delay);
+}
 
 function toast(message,type=''){
   const el=document.createElement('div'); el.className=`toast ${type}`; el.textContent=message;
@@ -82,25 +177,20 @@ function applyUiPreferences(){
   document.documentElement.classList.toggle('eco-mode',!!st.battery_saver || state.ecoMode);
 }
 
-function setDirty(value=true){
-  state.noteDirty=!!value;
-  const status=$('#autosave-state');
-  if(status && state.noteDirty) status.textContent=state.settings.autosave_enabled?'Salvando…':'Não salvo · Ctrl+S';
-  document.body.classList.toggle('note-dirty',state.noteDirty);
-  const activeTab=state.active?$(`[data-tab-note="${state.active.id}"]`):null;
-  activeTab?.classList.toggle('dirty',state.noteDirty);
-}
 function showSaveAnimation(){
   const el=$('#save-book');if(!el)return;
   el.classList.remove('play');void el.offsetWidth;el.classList.add('play');
   setTimeout(()=>el.classList.remove('play'),1600);
 }
 async function leaveCurrentNote(target){
-  if(!state.active || !$('#notion-content')) return true;
-  if(!state.noteDirty) return true;
-  if(state.settings.autosave_enabled){await saveNotionPage(state.active.id,true);return true;}
-  if(confirm('Existem alterações não salvas. Salvar antes de sair?')) await saveNotionPage(state.active.id,false);
-  return !state.noteDirty || confirm('Sair sem salvar estas alterações?');
+  if(!state.active||!$('#notion-content'))return true;
+  const id=Number(state.active.id),session=captureNoteRevision(id);
+  selectionManager.remember(id);
+  if(!session?.dirty)return true;
+  // Trocar de aba/rota não abandona a nota: a revisão fica no estado da aba e
+  // também em rascunho local. O autosave pode terminar depois sem tocar na nota ativa.
+  if(state.settings.autosave_enabled)void saveNotionPage(id,true);
+  return true;
 }
 function modal(title,body,foot='',className=''){
   $('#modal-root').innerHTML=`<div class="modal-backdrop"><div class="modal ${className}"><div class="modal-head"><div><span class="modal-kicker">REPOSIT+</span><h2>${esc(title)}</h2></div><button class="btn icon soft" data-close>${icon('cross-small')}</button></div><div class="modal-body">${body}</div>${foot?`<div class="modal-foot">${foot}</div>`:''}</div></div>`;
@@ -182,6 +272,29 @@ function execEditorCommand(command,value=null){
   if(!editor || !editor.contains(document.activeElement) && document.activeElement!==editor)return false;
   document.execCommand(command,false,value); return true;
 }
+function closeNoteFind(){document.querySelector('.note-findbar')?.remove();selectionManager.restore();}
+function findTextInEditor(query,backwards=false){
+  const editor=$('#notion-content');if(!editor||!query)return false;
+  const walker=document.createTreeWalker(editor,NodeFilter.SHOW_TEXT);const nodes=[];let text='',node;
+  while((node=walker.nextNode())){nodes.push({node,start:text.length,end:text.length+node.textContent.length});text+=node.textContent;}
+  const hay=text.toLocaleLowerCase(),needle=String(query).toLocaleLowerCase();if(!needle)return false;
+  let cursor=backwards?hay.length:0;const sel=window.getSelection();
+  if(sel?.rangeCount&&editor.contains(sel.anchorNode)){const range=sel.getRangeAt(0);const hit=nodes.find(x=>x.node===range.endContainer);if(hit)cursor=hit.start+range.endOffset+(backwards?-1:0);}
+  let index=backwards?hay.lastIndexOf(needle,Math.max(0,cursor)):hay.indexOf(needle,Math.max(0,cursor));
+  if(index<0)index=backwards?hay.lastIndexOf(needle):hay.indexOf(needle);if(index<0)return false;
+  const start=nodes.find(x=>index>=x.start&&index<x.end),endIndex=index+needle.length,end=nodes.find(x=>endIndex>x.start&&endIndex<=x.end);
+  if(!start||!end)return false;const range=document.createRange();range.setStart(start.node,index-start.start);range.setEnd(end.node,endIndex-end.start);
+  sel.removeAllRanges();sel.addRange(range);range.startContainer.parentElement?.scrollIntoView({block:'center'});selectionManager.remember();return true;
+}
+function openNoteFind(){
+  if(!state.active||!$('#notion-content'))return;selectionManager.remember();let bar=$('.note-findbar');
+  if(!bar){bar=document.createElement('div');bar.className='note-findbar';bar.innerHTML='<input type="search" placeholder="Procurar nesta nota" aria-label="Procurar nesta nota"><span class="note-find-result"></span><button type="button" data-find-prev title="Anterior">↑</button><button type="button" data-find-next title="Próximo">↓</button><button type="button" data-find-close title="Fechar">×</button>';$('.notion-page')?.appendChild(bar);
+    const input=$('input',bar),result=$('.note-find-result',bar);const run=back=>{const ok=findTextInEditor(input.value,back);result.textContent=input.value?(ok?'Encontrado':'Sem resultado'):'';};
+    input.addEventListener('input',()=>run(false));input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run(e.shiftKey);}if(e.key==='Escape'){e.preventDefault();closeNoteFind();}});
+    $('[data-find-prev]',bar).onclick=()=>run(true);$('[data-find-next]',bar).onclick=()=>run(false);$('[data-find-close]',bar).onclick=closeNoteFind;
+  }
+  const input=$('input',bar);input.focus();input.select();
+}
 
 async function configureNotebookMode(){
   const reduced=matchMedia('(prefers-reduced-motion: reduce)');
@@ -228,38 +341,45 @@ function renderShell(){
 
 function bindGlobal(){
   const picker=$('#global-file-picker');
-  if(picker) picker.onchange=()=>handleFiles([...picker.files]);
+  if(picker)picker.onchange=()=>handleFiles([...picker.files]);
   if(window.__repositGlobalBound)return;
   window.__repositGlobalBound=true;
-  document.addEventListener('selectionchange',()=>{if(state.active&&$('#notion-content'))updateToolbarState();});
+  document.addEventListener('selectionchange',()=>{if(state.active&&$('#notion-content')){selectionManager.remember();updateToolbarState();}});
   document.addEventListener('keydown',async e=>{
     const key=e.key.toLowerCase();
+    const editor=$('#notion-content');
+    const editorFocused=!!(editor&&(editor===document.activeElement||editor.contains(document.activeElement)));
     if(e.key==='Escape'){
-      if($('#modal-root').innerHTML){closeModal();return;}
-      if($('.note-context-menu')){closeNoteContextMenu();return;}
+      if($('.note-findbar')){e.preventDefault();closeNoteFind();return;}
+      if($('.note-context-menu')){e.preventDefault();closeNoteContextMenu();return;}
+      if($('#modal-root').innerHTML){e.preventDefault();closeModal();return;}
     }
-    if(e.ctrlKey && !e.altKey && key==='n'){e.preventDefault(); if(state.route!=='workspace')await navigate('workspace'); await createBlankNote({},true);return;}
-    if(e.ctrlKey && !e.altKey && key==='s'){e.preventDefault(); if(state.active)await saveNotionPage(state.active.id); else toast('Tudo salvo.','ok');return;}
-    if(e.ctrlKey && !e.altKey && key==='f'){e.preventDefault();$('#top-search')?.focus();$('#top-search')?.select();return;}
-    if(e.ctrlKey && !e.altKey && (key==='k'||key==='p')){e.preventDefault();$('#top-search')?.focus();$('#top-search')?.select();return;}
-    if(e.ctrlKey && key===','){e.preventDefault();await navigate('settings');return;}
-    if(e.ctrlKey && key==='/'){e.preventDefault();state.settingsTab='shortcuts';await navigate('settings','shortcuts');return;}
-    if(e.ctrlKey && key==='tab'){e.preventDefault();cycleNoteTab(e.shiftKey?-1:1);return;}
-    if(e.ctrlKey && !e.altKey && key==='w' && state.active){e.preventDefault();await closeNoteTab(state.active.id);return;}
-    if(e.altKey && e.key==='ArrowLeft' && state.active){e.preventDefault();await saveNotionPage(state.active.id,true);if(state.active.parent_note_id)await openNote(state.active.parent_note_id);else{state.active=null;await renderWorkspace();}return;}
-    if(e.ctrlKey && !e.shiftKey && /^[1-9]$/.test(e.key)){
-      const idx=Number(e.key)-1;if(state.openTabs[idx]){e.preventDefault();openNote(state.openTabs[idx].id);}return;
+    if(state.active&&editorFocused&&e.ctrlKey&&!e.altKey){
+      if(key==='b'){e.preventDefault();editorFormat('bold');return;}
+      if(key==='i'){e.preventDefault();editorFormat('italic');return;}
+      if(key==='u'){e.preventDefault();editorFormat('underline');return;}
+      if(key==='z'&&!e.shiftKey){e.preventDefault();editorFormat('undo');return;}
+      if(key==='y'||(key==='z'&&e.shiftKey)){e.preventDefault();editorFormat('redo');return;}
+      if(key==='k'){e.preventDefault();selectionManager.remember();insertLink();return;}
+      if(key==='v'&&e.shiftKey){forcePlainPasteOnce=true;setTimeout(()=>{forcePlainPasteOnce=false;},1000);}
     }
-    if(e.ctrlKey && !e.shiftKey && key==='d'){const id=state.active?.id||([...state.selected][0]);if(id){e.preventDefault();await duplicateNote(id);}return;}
-    if(e.ctrlKey && e.key==='Enter' && state.route==='workspace' && !state.active && state.selected.size===1){e.preventDefault();openNote([...state.selected][0]);return;}
-    if((e.key==='Delete'||e.key==='Backspace'&&e.ctrlKey) && state.route==='workspace' && !state.active && state.selected.size && !['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)){
-      e.preventDefault(); const ids=[...state.selected]; if(ids.length===1)confirmDeleteNote(ids[0]); else confirmDeleteMany(ids);return;
+    if(e.ctrlKey&&!e.altKey&&key==='n'){e.preventDefault();if(state.route!=='workspace')await navigate('workspace');await createBlankNote({},true);return;}
+    if(e.ctrlKey&&!e.altKey&&key==='s'){e.preventDefault();if(state.active){captureNoteRevision(state.active.id);await saveNotionPage(state.active.id,false,{force:true});}else toast('Tudo salvo.','ok');return;}
+    if(e.ctrlKey&&!e.altKey&&key==='f'&&!e.shiftKey){e.preventDefault();if(state.active&&editor)openNoteFind();else{$('#top-search')?.focus();$('#top-search')?.select();}return;}
+    if(e.ctrlKey&&e.shiftKey&&key==='f'){e.preventDefault();$('#top-search')?.focus();$('#top-search')?.select();return;}
+    if(e.ctrlKey&&!e.altKey&&key==='p'){e.preventDefault();$('#top-search')?.focus();$('#top-search')?.select();return;}
+    if(e.ctrlKey&&key===','){e.preventDefault();await navigate('settings');return;}
+    if(e.ctrlKey&&key==='/'){e.preventDefault();state.settingsTab='shortcuts';await navigate('settings','shortcuts');return;}
+    if(e.ctrlKey&&key==='tab'){e.preventDefault();cycleNoteTab(e.shiftKey?-1:1);return;}
+    if(e.ctrlKey&&!e.altKey&&key==='w'&&state.active){e.preventDefault();await closeNoteTab(state.active.id);return;}
+    if(e.altKey&&e.key==='ArrowLeft'&&state.active){e.preventDefault();await leaveCurrentNote('back');if(state.active?.parent_note_id)await openNote(state.active.parent_note_id);else{state.active=null;await renderWorkspace();}return;}
+    if(e.ctrlKey&&!e.shiftKey&&/^[1-9]$/.test(e.key)){const idx=Number(e.key)-1;if(state.openTabs[idx]){e.preventDefault();openNote(state.openTabs[idx].id);}return;}
+    if(e.ctrlKey&&!e.shiftKey&&key==='d'){const id=state.active?.id||([...state.selected][0]);if(id){e.preventDefault();await duplicateNote(id);}return;}
+    if(e.ctrlKey&&e.key==='Enter'&&state.route==='workspace'&&!state.active&&state.selected.size===1){e.preventDefault();openNote([...state.selected][0]);return;}
+    if((e.key==='Delete'||e.key==='Backspace'&&e.ctrlKey)&&state.route==='workspace'&&!state.active&&state.selected.size&&!['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)){
+      e.preventDefault();const ids=[...state.selected];if(ids.length===1)confirmDeleteNote(ids[0]);else confirmDeleteMany(ids);return;
     }
-    if(e.key==='F2' && state.route==='workspace' && !state.active && state.selected.size===1){
-      e.preventDefault();const id=[...state.selected][0];const input=$(`[data-inline="title"][data-id="${id}"]`);input?.focus();input?.select();return;
-    }
-    if(state.active && $('#notion-content')){
-    }
+    if(e.key==='F2'&&state.route==='workspace'&&!state.active&&state.selected.size===1){e.preventDefault();const id=[...state.selected][0];const input=$(`[data-inline="title"][data-id="${id}"]`);input?.focus();input?.select();}
   });
   window.addEventListener('dragover',e=>{if(state.route!=='workspace')return;e.preventDefault();$('.drop-zone')?.classList.add('show');});
   window.addEventListener('dragleave',e=>{if(!e.relatedTarget)$('.drop-zone')?.classList.remove('show');});
@@ -282,7 +402,7 @@ async function navigate(route,section=''){
 }
 
 async function renderWorkspace(){
-  document.body.classList.remove('note-open');state.noteDirty=false;
+  document.body.classList.remove('note-open','note-dirty');state.noteDirty=false;
   $('#main').innerHTML=`<section class="page workspace-page site-workspace"><div class="workspace-body"><div class="workspace-scroll" id="workspace-scroll"><section class="workspace-section notes-section sheet-section"><div class="workspace-top-controls"><div class="period-tabs period-tabs-large" id="period-tabs"><button data-period="all" class="period-all ${state.period==='all'?'active':''}">${icon('apps')}<span>Todas as notas</span><b>${state.notes.length||''}</b></button><button data-period="today" class="${state.period==='today'?'active':''}">Hoje</button><button data-period="week" class="${state.period==='week'?'active':''}">Esta semana</button><button data-period="month" class="${state.period==='month'?'active':''}">Este mês</button></div><div class="toolbar-spacer"></div><span id="selection-info" class="selection-info"></span><label class="kind-filter">${icon('filter')}<input id="kind-filter" list="kind-options-filter" placeholder="Tipo" value="${esc(state.kind)}"><datalist id="kind-options-filter"><option>Anotação</option><option>Atividade</option><option>Material</option><option>Trabalho</option><option>Resumo</option><option>Lembrete</option></datalist></label><button class="btn soft" id="manage-tags">${icon('tags')} Tags</button><button class="btn primary workspace-new-note" id="workspace-new-note">${icon('plus')} Nova nota</button></div><div id="workspace-tags" class="workspace-tags"></div><div id="notes-content" class="notes-content"><div class="loading-block">Carregando notas…</div></div></section></div><div class="drop-zone"><div>${icon('clip')}<strong>Solte os arquivos aqui</strong></div></div><div id="note-tabbar" class="note-tabbar"></div></div></section>`;
   $('#workspace-new-note').onclick=()=>createBlankNote({},true);
   $('#kind-filter').oninput=e=>{state.kind=e.target.value;clearTimeout(searchTimer);searchTimer=setTimeout(loadNotes,180);};$('#manage-tags').onclick=openTagManager;
@@ -405,22 +525,28 @@ function updateTabTitle(id,value,field='title'){
   if(tab){tab.title=value||'Sem título';renderNoteTabs();}
 }
 async function closeNoteTab(id){
-  id=Number(id);
-  const idx=state.openTabs.findIndex(t=>t.id===id);
-  if(state.active?.id===id && $('#notion-content')) await saveNotionPage(id,true);
+  id=Number(id);const idx=state.openTabs.findIndex(t=>t.id===id);
+  if(state.active?.id===id&&$('#notion-content'))captureNoteRevision(id);
+  const session=noteSessions.get(id);
+  if(session?.dirty&&state.settings.autosave_enabled)await saveNotionPage(id,true,{force:true});
+  if(session?.dirty){
+    const closeAnyway=confirm('Esta nota ainda tem alterações pendentes. Fechar a aba mesmo assim? O Reposit+ manterá um rascunho local para recuperar depois.');
+    if(!closeAnyway)return;
+  }
+  if(session?.timer){clearTimeout(session.timer);session.timer=null;}
   state.openTabs=state.openTabs.filter(t=>t.id!==id);
+  if(!session?.dirty&&!session?.inFlight){noteSessions.delete(id);clearNoteDraft(id);selectionManager.clear(id);}
   if(state.active?.id===id){
     const fallback=state.openTabs[Math.min(Math.max(idx-1,0),Math.max(state.openTabs.length-1,0))];
     state.active=null;
-    if(fallback) await openNote(fallback.id);
-    else await renderWorkspace();
+    if(fallback)await openNote(fallback.id);else await renderWorkspace();
   }else renderNoteTabs();
 }
 function renderNoteTabs(){
   const bar=$('#note-tabbar');if(!bar)return;
   const activeId=state.active?.id||0;
   bar.innerHTML=`<button class="note-tab note-tab-home ${!activeId?'active':''}" id="tab-home" title="Todas as notas">${icon('apps')}<span>Todas</span></button>
-    <div class="note-tabs-scroll">${state.openTabs.map(t=>`<button class="note-tab ${activeId===t.id?'active':''} ${activeId===t.id&&state.noteDirty?'dirty':''} ${t.parent_note_id?'subnote-tab':''}" data-tab-note="${t.id}" title="${esc(t.parent_note_id?`${t.parent_title||'Nota'} › ${t.title}`:t.title)}"><span class="tab-doc">${t.parent_note_id?icon('angle-right'):icon('document')}</span><span class="tab-title">${esc(t.title||'Sem título')}</span><span class="tab-close" data-close-tab="${t.id}">${icon('cross-small')}</span></button>`).join('')}</div>
+    <div class="note-tabs-scroll">${state.openTabs.map(t=>`<button class="note-tab ${activeId===t.id?'active':''} ${noteSessions.get(t.id)?.dirty?'dirty':''} ${t.parent_note_id?'subnote-tab':''}" data-tab-note="${t.id}" title="${esc(t.parent_note_id?`${t.parent_title||'Nota'} › ${t.title}`:t.title)}"><span class="tab-doc">${t.parent_note_id?icon('angle-right'):icon('document')}</span><span class="tab-title">${esc(t.title||'Sem título')}</span><span class="tab-close" data-close-tab="${t.id}">${icon('cross-small')}</span></button>`).join('')}</div>
     <button class="note-tab-add" id="tab-new" title="Nova nota">${icon('plus')}</button>`;
   $('#tab-home').onclick=async()=>{if(!(await leaveCurrentNote('workspace')))return;state.active=null;await renderWorkspace();};
   $$('[data-tab-note]').forEach(b=>b.onclick=e=>{if(e.target.closest('[data-close-tab]'))return;openNote(Number(b.dataset.tabNote));});
@@ -442,19 +568,18 @@ async function createBlankNote(prefill={}, openAfter=false){
   }catch(err){toast(err.message,'err');}
 }
 async function openNote(id){
+  id=Number(id);const requestSeq=++openNoteRequestSeq;
   try{
-    if(state.active && state.active.id!==Number(id) && $('#notion-content') && !(await leaveCurrentNote('note'))) return;
+    if(state.active&&state.active.id!==id&&$('#notion-content'))await leaveCurrentNote('note');
     state.route='workspace';
-    state.active=await get(`/api/notes/${id}`);
-    if(state.active.parent_note){
-      ensureNoteTab({...state.active.parent_note,parent_note_id:state.active.parent_note.parent_note_id||null});
-    }
+    const loaded=await get(`/api/notes/${id}`);
+    if(requestSeq!==openNoteRequestSeq)return;
+    state.active=materializeSessionNote(loaded);
+    if(state.active.parent_note)ensureNoteTab({...state.active.parent_note,parent_note_id:state.active.parent_note.parent_note_id||null});
     ensureNoteTab(state.active);
     $$('[data-route]').forEach(b=>b.classList.toggle('active',b.dataset.route==='workspace'));
-    setHeader('workspace');
-    renderNotionPage();
-    animateMain('tab');
-  }catch(err){toast(err.message,'err');}
+    setHeader('workspace');renderNotionPage();animateMain('tab');
+  }catch(err){if(requestSeq===openNoteRequestSeq)toast(err.message,'err');}
 }
 function humanSize(bytes=0){
   const n=Number(bytes)||0;if(n<1024)return `${n} B`;if(n<1048576)return `${(n/1024).toFixed(1)} KB`;return `${(n/1048576).toFixed(1)} MB`;
@@ -520,14 +645,36 @@ function contentToEditorHtml(note){
   if(orphanFiles.length)html+=orphanFiles.map(attachmentBlockHtml).join('');
   return html;
 }
+const RICH_ALLOWED_TAGS=new Set(['P','DIV','BR','H1','H2','H3','H4','H5','H6','STRONG','B','EM','I','U','S','STRIKE','SUP','SUB','UL','OL','LI','BLOCKQUOTE','A','TABLE','THEAD','TBODY','TFOOT','TR','TD','TH','SPAN','FONT','HR','PRE','CODE']);
+const RICH_ALLOWED_STYLES=new Set(['color','background-color','text-align','font-weight','font-style','text-decoration','font-family','font-size','white-space']);
+function sanitizeInlineStyle(value=''){
+  return String(value).split(';').map(part=>part.trim()).filter(Boolean).map(part=>{const idx=part.indexOf(':');if(idx<1)return '';const key=part.slice(0,idx).trim().toLowerCase(),val=part.slice(idx+1).trim();if(!RICH_ALLOWED_STYLES.has(key))return '';if(/expression|url\s*\(|javascript:/i.test(val))return '';return `${key}:${val}`;}).filter(Boolean).join(';');
+}
 function sanitizeRichHtml(raw=''){
-  const box=document.createElement('div');box.innerHTML=raw;
-  box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(n=>n.remove());
-  box.querySelectorAll('*').forEach(el=>{
-    [...el.attributes].forEach(a=>{if(/^on/i.test(a.name) || ['srcdoc'].includes(a.name))el.removeAttribute(a.name);});
-    if(el.tagName==='A'){const href=el.getAttribute('href')||'';if(!/^(https?:|#)/i.test(href))el.removeAttribute('href');el.setAttribute('rel','noopener');}
+  const box=document.createElement('div');box.innerHTML=String(raw||'');
+  box.querySelectorAll('script,style,iframe,object,embed,link,meta,form,input,button,textarea,select,svg,math').forEach(n=>n.remove());
+  [...box.querySelectorAll('*')].forEach(el=>{
+    if(!RICH_ALLOWED_TAGS.has(el.tagName)){el.replaceWith(...el.childNodes);return;}
+    [...el.attributes].forEach(attr=>{
+      const name=attr.name.toLowerCase();
+      const allowed=(name==='style')||(el.tagName==='A'&&['href','title','target'].includes(name))||(el.tagName==='FONT'&&['face','size','color'].includes(name))||(['TD','TH'].includes(el.tagName)&&['colspan','rowspan'].includes(name))||(el.tagName==='TABLE'&&name==='data-editor-table')||(el.tagName==='TABLE'&&name==='class');
+      if(!allowed||/^on/i.test(name)||name==='srcdoc')el.removeAttribute(attr.name);
+    });
+    if(el.hasAttribute('style')){const clean=sanitizeInlineStyle(el.getAttribute('style'));if(clean)el.setAttribute('style',clean);else el.removeAttribute('style');}
+    if(el.tagName==='TABLE'){if(el.getAttribute('class')!=='editor-table')el.removeAttribute('class');if(el.getAttribute('data-editor-table')!=='1')el.removeAttribute('data-editor-table');}
+    if(el.tagName==='A'){const href=el.getAttribute('href')||'';if(!/^(https?:|mailto:|#)/i.test(href))el.removeAttribute('href');if(el.getAttribute('target')==='_blank')el.setAttribute('rel','noopener noreferrer');}
   });
   return box.innerHTML;
+}
+function insertPlainTextAtSelection(text=''){
+  const editor=$('#notion-content');if(!editor)return;selectionManager.restore();const normalized=String(text).replace(/\r\n?/g,'\n');
+  if(!document.execCommand('insertText',false,normalized)){const sel=window.getSelection(),range=sel?.rangeCount?sel.getRangeAt(0):null;if(range&&editor.contains(range.startContainer)){range.deleteContents();const node=document.createTextNode(normalized);range.insertNode(node);range.setStartAfter(node);range.collapse(true);sel.removeAllRanges();sel.addRange(range);}}
+}
+function handleEditorPaste(event){
+  const editor=$('#notion-content');if(!editor)return;event.preventDefault();selectionManager.remember();
+  const plain=event.clipboardData?.getData('text/plain')||'';const html=event.clipboardData?.getData('text/html')||'';
+  if(forcePlainPasteOnce||!html)insertPlainTextAtSelection(plain);else{selectionManager.restore();document.execCommand('insertHTML',false,sanitizeRichHtml(html));}
+  forcePlainPasteOnce=false;editor.dispatchEvent(new Event('input',{bubbles:true}));selectionManager.remember();
 }
 function serializeEditorContent(editor){
   if(!editor)return '';
@@ -598,12 +745,12 @@ function imageLayoutMenuHtml(block){
   const active=(kind,value)=>m[kind]===value?' active':'';const slider=m.width==='auto'?100:Number(m.width);
   return `<div class="context-title">Imagem · tamanho</div><div class="image-size-slider"><input type="range" min="15" max="100" step="1" value="${slider}" data-image-slider><output>${m.width==='auto'?'Auto':m.width+'%'}</output></div><div class="context-grid context-grid-5"><button class="${active('width','auto')}" data-image-width="auto">Auto</button><button class="${active('width','25')}" data-image-width="25">25%</button><button class="${active('width','50')}" data-image-width="50">50%</button><button class="${active('width','75')}" data-image-width="75">75%</button><button class="${active('width','100')}" data-image-width="100">100%</button></div><div class="context-title">Proporção</div><div class="context-grid"><button class="${active('ratio','auto')}" data-image-ratio="auto">Original</button><button class="${active('ratio','1x1')}" data-image-ratio="1x1">1:1</button><button class="${active('ratio','4x3')}" data-image-ratio="4x3">4:3</button><button class="${active('ratio','16x9')}" data-image-ratio="16x9">16:9</button></div><div class="context-title">Encaixe</div><div class="context-grid context-grid-2"><button class="${active('fit','contain')}" data-image-fit="contain">Ajustar inteira</button><button class="${active('fit','cover')}" data-image-fit="cover">Preencher/cortar</button></div>`;
 }
-function rememberEditorSelection(){const editor=$('#notion-content'),sel=window.getSelection();if(editor&&sel?.rangeCount&&editor.contains(sel.anchorNode))savedEditorRange=sel.getRangeAt(0).cloneRange();}
-function restoreEditorSelection(){const editor=$('#notion-content');if(!editor)return;editor.focus();if(savedEditorRange){const sel=window.getSelection();sel.removeAllRanges();sel.addRange(savedEditorRange);}}
-function contextEditorFormat(command,value=null){restoreEditorSelection();editorFormat(command,value);}
-function contextEditorBlock(tag){restoreEditorSelection();editorBlock(tag);}
+function rememberEditorSelection(){return selectionManager.remember();}
+function restoreEditorSelection(){return selectionManager.restore();}
+function contextEditorFormat(command,value=null){selectionManager.restore();editorFormat(command,value);}
+function contextEditorBlock(tag){selectionManager.restore();editorBlock(tag);}
 function editorFormat(command,value=null){
-  const editor=$('#notion-content');if(!editor)return;editor.focus();document.execCommand(command,false,value);editor.dispatchEvent(new Event('input',{bubbles:true}));updateToolbarState();
+  const editor=$('#notion-content');if(!editor)return;selectionManager.restore();document.execCommand(command,false,value);editor.dispatchEvent(new Event('input',{bubbles:true}));selectionManager.remember();updateToolbarState();
 }
 function editorBlock(tag){editorFormat('formatBlock',tag);}
 function insertLink(){const url=prompt('Cole o link:','https://');if(url)editorFormat('createLink',url);}
@@ -680,80 +827,133 @@ function openNoteContextMenu(event,n){
     $('[data-note-menu="export"]',menu)?.addEventListener('click',()=>{closeNoteContextMenu();openExportModal(n.id);});
     $('[data-note-menu="delete-subnote"]',menu)?.addEventListener('click',()=>{closeNoteContextMenu();confirmDeleteNote(n.id);});
     $$('[data-context-open]',menu).forEach(b=>b.onclick=()=>{closeNoteContextMenu();window.open(`/api/note-files/${b.dataset.contextOpen}`,'_blank');});
-    $$('[data-context-delete]',menu).forEach(b=>b.onclick=async()=>{try{await del(`/api/note-files/${b.dataset.contextDelete}`);closeNoteContextMenu();state.active=await get(`/api/notes/${n.id}`);renderNotionPage();toast('Anexo removido.','ok');}catch(err){toast(err.message,'err');}});
+    $$('[data-context-delete]',menu).forEach(b=>b.onclick=async()=>{try{await del(`/api/note-files/${b.dataset.contextDelete}`);closeNoteContextMenu();state.active=materializeSessionNote(await get(`/api/notes/${n.id}`));renderNotionPage();toast('Anexo removido.','ok');}catch(err){toast(err.message,'err');}});
   }
   setTimeout(()=>document.addEventListener('mousedown',e=>{if(!e.target.closest('.note-context-menu'))closeNoteContextMenu();},{once:true}),0);
 }
 function renderNotionPage(){
   const n=state.active;if(!n)return;
-  document.body.classList.add('note-open');state.noteDirty=false;
+  const session=noteSession(n.id,n);
+  document.body.classList.add('note-open');state.noteDirty=!!session?.dirty;
   const main=$('#main');if(!main)return;
   const tagSuggestions=(state.noteTags||[]).map(t=>`<option value="${esc(t.name)}"></option>`).join('');
   const parent=n.parent_note||null;
-  main.innerHTML=`<section class="page notion-page rich-note-page ${parent?'subnote-page':''}"><div class="notion-topline"><button class="notion-back" id="notion-back">${icon('angle-left')} Voltar</button><div class="notion-browser-trail">${parent?`<button data-parent-note="${parent.id}">${esc(parent.title||'Nota principal')}</button><span>${icon('angle-right')}</span>`:''}<strong>${esc(n.title||'Sem título')}</strong></div><div class="notion-top-actions"><span class="save-book" id="save-book" aria-hidden="true"><i></i><i></i><i></i></span><span class="autosave-state" id="autosave-state">${state.settings.autosave_enabled?'Salvo':'Salvo · manual'}</span><button class="btn soft" id="notion-pin">${icon('bookmark')} ${n.pinned?'Fixada':'Fixar'}</button><button class="btn soft" id="notion-export">${icon('export')} Exportar</button><button class="btn ghost-danger notion-trash" id="notion-delete" title="Excluir anotação">${icon('trash')}</button></div></div>
+  main.innerHTML=`<section class="page notion-page rich-note-page ${parent?'subnote-page':''}"><div class="notion-topline"><button class="notion-back" id="notion-back">${icon('angle-left')} Voltar</button><div class="notion-browser-trail">${parent?`<button data-parent-note="${parent.id}">${esc(parent.title||'Nota principal')}</button><span>${icon('angle-right')}</span>`:''}<strong>${esc(n.title||'Sem título')}</strong></div><div class="notion-top-actions"><span class="save-book" id="save-book" aria-hidden="true"><i></i><i></i><i></i></span><span class="autosave-state" id="autosave-state"></span><button class="save-retry" id="save-retry" type="button" hidden>Tentar novamente</button><button class="btn soft" id="notion-pin">${icon('bookmark')} ${n.pinned?'Fixada':'Fixar'}</button><button class="btn soft" id="notion-export">${icon('export')} Exportar</button><button class="btn ghost-danger notion-trash" id="notion-delete" title="Excluir anotação">${icon('trash')}</button></div></div>
     <div class="editor-toolbar editor-toolbar-primary" id="editor-toolbar" role="toolbar"><div class="tool-group tool-history"><button data-cmd="undo" title="Desfazer">${icon('undo')}</button><button data-cmd="redo" title="Refazer">${icon('redo')}</button></div><div class="tool-group tool-block"><select id="block-format" title="Estilo"><option value="p">Texto</option><option value="h1">Título 1</option><option value="h2">Título 2</option><option value="h3">Título 3</option></select><select id="font-size" title="Tamanho"><option value="2">12</option><option value="3" selected>14</option><option value="4">18</option><option value="5">24</option><option value="6">32</option><option value="7">48</option></select></div><div class="tool-group text-tools primary-text-tools"><button data-cmd="bold" title="Negrito">${icon('bold')}</button><button data-cmd="italic" title="Itálico">${icon('italic')}</button><button data-cmd="underline" title="Sublinhado">${icon('underline')}</button></div><div class="tool-group primary-lists"><button data-cmd="insertUnorderedList" title="Lista com marcadores">${icon('list')}</button><button data-cmd="insertOrderedList" title="Lista numerada">${icon('numbered-list')}</button></div><div class="tool-group insert-tools primary-insert"><button id="tool-attach" class="tool-action">${icon('clip')}<span>Arquivo</span></button><button id="tool-subnote" class="tool-action">${icon('plus')}<span>Subnota</span></button></div></div>
     <div class="notion-scroll"><article class="notion-document" id="note-context-area">${parent?`<div class="subnote-banner"><span>SUBNOTA</span><button data-parent-note="${parent.id}">${icon('angle-left')} ${esc(parent.title||'Nota principal')}</button></div>`:''}<input id="notion-title" class="notion-title" value="${esc(n.title)}" placeholder="Sem título"><div class="notion-properties notion-properties-inline"><label><span>${icon('label')}</span><input id="notion-kind" list="notion-kind-options" value="${esc(n.kind||'Anotação')}" aria-label="Tipo"><datalist id="notion-kind-options"><option>Anotação</option><option>Atividade</option><option>Material</option><option>Trabalho</option><option>Resumo</option><option>Lembrete</option><option>Subnota</option><option>Outro</option></datalist></label><label class="tag-property"><span>${icon('tags')}</span><input id="notion-tags" list="note-tag-suggestions" value="${esc(n.tags||'')}" placeholder="Tags separadas por vírgula"><datalist id="note-tag-suggestions">${tagSuggestions}</datalist></label><div class="notion-property-static"><span>${icon('clock')}</span><strong>${fmt(n.updated_at)}</strong></div></div><div class="note-tag-chips" id="note-tag-chips">${renderTagChips(n.tags||'')}</div><div id="notion-content" class="notion-content rich-editor" contenteditable="true" spellcheck="true" data-placeholder="Comece a escrever…">${contentToEditorHtml(n)}</div></article></div><div id="note-tabbar" class="note-tabbar"></div></section>`;
   const leave=async target=>{if(!(await leaveCurrentNote(target)))return false;return true;};
   $('#notion-back').onclick=async()=>{if(!(await leave(parent?'parent':'workspace')))return;if(parent)await openNote(parent.id);else{state.active=null;await renderWorkspace();}};
   $$('[data-parent-note]').forEach(b=>b.onclick=async()=>{if(await leave('parent'))await openNote(Number(b.dataset.parentNote));});
-  $('#notion-pin').onclick=async()=>{if(state.noteDirty)await saveNotionPage(n.id,true);state.active=await patch(`/api/notes/${n.id}`,{pinned:!n.pinned});ensureNoteTab(state.active);renderNotionPage();};
+  $('#notion-pin').onclick=async()=>{captureNoteRevision(n.id);if(noteSessions.get(n.id)?.dirty)await saveNotionPage(n.id,true,{force:true});if(noteSessions.get(n.id)?.dirty)return toast('Salve as alterações antes de fixar a nota.','err');const saved=await patch(`/api/notes/${n.id}`,{pinned:!n.pinned});if(state.active?.id===n.id)state.active=materializeSessionNote(saved);ensureNoteTab(saved);renderNotionPage();};
   $('#notion-export').onclick=()=>openExportModal(n.id);$('#notion-delete').onclick=()=>confirmDeleteNote(n.id);$('#note-context-area').oncontextmenu=e=>openNoteContextMenu(e,n);
-  const scheduleSave=()=>{setDirty(true);clearTimeout(saveTimer);if(state.settings.autosave_enabled)saveTimer=setTimeout(()=>saveNotionPage(n.id,true),850);};
-  ['#notion-title','#notion-kind','#notion-tags','#notion-content'].forEach(sel=>$(sel)?.addEventListener('input',()=>{if(sel==='#notion-tags')$('#note-tag-chips').innerHTML=renderTagChips($('#notion-tags').value);if(sel==='#notion-title')updateTabTitle(n.id,$('#notion-title').value);scheduleSave();}));
-  ['#notion-title','#notion-kind','#notion-tags'].forEach(sel=>$(sel)?.addEventListener('blur',()=>{if(state.settings.autosave_enabled&&state.noteDirty)saveNotionPage(n.id,true);}));
-  $$('[data-cmd]').forEach(b=>b.onmousedown=e=>{e.preventDefault();editorFormat(b.dataset.cmd);setDirty(true);});$('#block-format').onchange=e=>{editorBlock(e.target.value);setDirty(true);};$('#font-size').onchange=e=>{editorFormat('fontSize',e.target.value);setDirty(true);};
-  $('#tool-attach').onclick=()=>$('#global-file-picker').click();$('#tool-subnote').onclick=()=>createSubnote(n.id);
-  $$('[data-tag-jump]').forEach(b=>b.onclick=async()=>{if(!(await leave('tag')))return;state.tag=b.dataset.tagJump;state.active=null;await renderWorkspace();});bindInlineAttachments(n);renderNoteTabs();setTimeout(()=>{$('#notion-content')?.focus();updateToolbarState();},30);
+  const onEditorChange=()=>{captureNoteRevision(n.id,{increment:true});scheduleNoteSave(n.id);};
+  ['#notion-title','#notion-kind','#notion-tags','#notion-content'].forEach(sel=>$(sel)?.addEventListener('input',()=>{if(sel==='#notion-tags')$('#note-tag-chips').innerHTML=renderTagChips($('#notion-tags').value);if(sel==='#notion-title')updateTabTitle(n.id,$('#notion-title').value);onEditorChange();}));
+  ['#notion-title','#notion-kind','#notion-tags'].forEach(sel=>$(sel)?.addEventListener('blur',()=>{const current=noteSessions.get(n.id);if(state.settings.autosave_enabled&&current?.dirty&&!current.isComposing)void saveNotionPage(n.id,true);}));
+  const editor=$('#notion-content');
+  editor?.addEventListener('paste',handleEditorPaste);
+  editor?.addEventListener('compositionstart',()=>{const current=noteSession(n.id);current.isComposing=true;if(current.timer){clearTimeout(current.timer);current.timer=null;}syncSaveUi(n.id);});
+  editor?.addEventListener('compositionend',()=>{const current=noteSession(n.id);current.isComposing=false;captureNoteRevision(n.id);scheduleNoteSave(n.id,450);});
+  editor?.addEventListener('keyup',()=>selectionManager.remember(n.id));editor?.addEventListener('mouseup',()=>selectionManager.remember(n.id));
+  $('#editor-toolbar')?.addEventListener('pointerdown',()=>selectionManager.remember(n.id),true);
+  $$('[data-cmd]').forEach(b=>b.onmousedown=e=>{e.preventDefault();selectionManager.restore(n.id);editorFormat(b.dataset.cmd);});
+  $('#block-format').onchange=e=>{selectionManager.restore(n.id);editorBlock(e.target.value);};$('#font-size').onchange=e=>{selectionManager.restore(n.id);editorFormat('fontSize',e.target.value);};
+  $('#tool-attach').onclick=()=>{selectionManager.remember(n.id);pendingAttachmentNoteId=n.id;$('#global-file-picker').click();};
+  $('#tool-subnote').onclick=()=>{selectionManager.remember(n.id);createSubnote(n.id);};
+  $('#save-retry').onclick=async()=>{captureNoteRevision(n.id);await saveNotionPage(n.id,false,{force:true});};
+  $$('[data-tag-jump]').forEach(b=>b.onclick=async()=>{if(!(await leave('tag')))return;state.tag=b.dataset.tagJump;state.active=null;await renderWorkspace();});
+  bindInlineAttachments(n);renderNoteTabs();syncSaveUi(n.id);setTimeout(()=>{editor?.focus();selectionManager.remember(n.id);updateToolbarState();},30);
 }
+
 function renderTagChips(raw=''){
   const tags=String(raw||'').split(/[,;\n]+/).map(x=>x.trim().replace(/^#/, '')).filter(Boolean);
   return [...new Set(tags.map(x=>x.toLowerCase()))].map(k=>tags.find(x=>x.toLowerCase()===k)).map(t=>`<button type="button" class="note-tag-chip" data-tag-jump="${esc(t)}">#${esc(t)}</button>`).join('');
 }
 async function createSubnote(parentId){
+  parentId=Number(parentId);
   try{
-    rememberEditorSelection();
+    selectionManager.remember(parentId);
     const child=await post(`/api/notes/${parentId}/subnotes`,{title:'Nova subnota'});
-    state.active=await get(`/api/notes/${parentId}`);
-    placeSubnoteAtCaret($('#notion-content'),child);
-    await saveNotionPage(parentId,true);
+    if(state.active?.id!==parentId)return;
+    selectionManager.restore(parentId);placeSubnoteAtCaret($('#notion-content'),child);
+    await saveNotionPage(parentId,true,{force:true});
     ensureNoteTab(state.active);ensureNoteTab({...child,parent_note_id:parentId,parent_title:state.active.title});
-    await openNote(child.id);
-    setTimeout(()=>{$('#notion-title')?.focus();$('#notion-title')?.select();},60);
-    toast('Subnota criada em uma nova aba.','ok');
+    await openNote(child.id);setTimeout(()=>{$('#notion-title')?.focus();$('#notion-title')?.select();},60);toast('Subnota criada em uma nova aba.','ok');
   }catch(err){toast(err.message,'err');}
 }
-async function saveNotionPage(id,quiet=false){
-  if(!state.active||state.active.id!==id)return;
-  clearTimeout(saveTimer);
-  const payload={title:$('#notion-title')?.value||'Sem título',kind:$('#notion-kind')?.value||'Anotação',tags:$('#notion-tags')?.value||'',content:serializeEditorContent($('#notion-content')),content_format:'html'};
-  const status=$('#autosave-state');if(status)status.textContent='Salvando…';
-  try{state.active=await patch(`/api/notes/${id}`,payload);ensureNoteTab(state.active);const idx=state.notes.findIndex(x=>x.id===id);if(idx>=0)Object.assign(state.notes[idx],state.active);state.noteDirty=false;document.body.classList.remove('note-dirty');if(status)status.textContent=state.settings.autosave_enabled?'Salvo':'Salvo · manual';const crumb=$('.notion-browser-trail strong');if(crumb)crumb.textContent=state.active.title||'Sem título';showSaveAnimation();renderNoteTabs();}
-  catch(err){setDirty(true);if(status)status.textContent='Erro ao salvar';if(!quiet)toast(err.message,'err');}
+function applySavedNoteResult(id,saved,sentRevision){
+  const session=noteSessions.get(Number(id));if(!session)return;
+  const tabNote=session.dirty&&session.payload&&session.saveRevision>sentRevision?{...saved,...session.payload}:saved;
+  ensureNoteTab(tabNote);const idx=state.notes.findIndex(x=>Number(x.id)===Number(id));if(idx>=0)Object.assign(state.notes[idx],saved);
+  if(state.active?.id===Number(id)){
+    const hasNewer=session.dirty&&session.saveRevision>sentRevision;
+    state.active=hasNewer&&session.payload?{...saved,...session.payload,edit_revision:session.savedRevision}:saved;
+    const crumb=$('.notion-browser-trail strong');if(crumb)crumb.textContent=(hasNewer?session.payload?.title:saved.title)||'Sem título';
+    const stamp=$('.notion-property-static strong');if(stamp)stamp.textContent=fmt(saved.updated_at);
+    showSaveAnimation();
+  }
+}
+async function saveNotionPage(id,quiet=false,options={}){
+  id=Number(id);const force=!!options.force;const session=noteSession(id,state.active?.id===id?state.active:null);if(!session)return true;
+  if(state.active?.id===id&&$('#notion-content'))captureNoteRevision(id);
+  if(session.timer){clearTimeout(session.timer);session.timer=null;}
+  if(!session.dirty){syncSaveUi(id);return true;}
+  const maxPasses=force?6:3;
+  for(let pass=0;pass<maxPasses&&session.dirty;pass++){
+    if(session.inFlight){await session.inFlight;continue;}
+    if(!session.payload){session.error='A revisão pendente não possui conteúdo recuperável.';persistNoteDraft(session);syncSaveUi(id);break;}
+    const sentRevision=session.saveRevision;const payload={...session.payload,save_revision:sentRevision};session.error=null;syncSaveUi(id);
+    session.inFlight=(async()=>{
+      try{
+        const saved=await patch(`/api/notes/${id}`,payload);const ack=Math.max(sentRevision,Number(saved?.edit_revision||sentRevision));
+        session.savedRevision=Math.max(session.savedRevision,ack);session.error=null;
+        if(session.savedRevision>=session.saveRevision){session.dirty=false;session.payload=null;clearNoteDraft(id);}else{session.dirty=true;persistNoteDraft(session);}
+        applySavedNoteResult(id,saved,sentRevision);return true;
+      }catch(err){
+        const latest=Number(err?.data?.detail?.current_revision);
+        if(err?.status===409&&Number.isFinite(latest)){
+          session.savedRevision=Math.max(session.savedRevision,latest);session.saveRevision=Math.max(session.saveRevision,latest+1);session.dirty=true;session.error='Conflito de revisão detectado. A versão atual será reenviada.';persistNoteDraft(session);return 'retry';
+        }
+        session.dirty=true;session.error=err?.message||'Erro ao salvar';persistNoteDraft(session);if(!quiet)toast(session.error,'err');return false;
+      }finally{session.inFlight=null;syncSaveUi(id);}
+    })();
+    syncSaveUi(id);
+    const result=await session.inFlight;
+    if(result===false)break;
+    if(result==='retry')continue;
+    if(!force&&!session.dirty)break;
+  }
+  if(session.dirty&&state.settings.autosave_enabled&&!session.error)scheduleNoteSave(id,900);
+  syncSaveUi(id);return !session.dirty;
 }
 
 async function deleteInlineSubnote(id,parentId,block=null){
   modal('Excluir subnota','<p>A subnota será removida da nota principal. Essa ação não apaga os outros conteúdos.</p>',`<button class="btn soft" data-close>Cancelar</button><button class="btn danger" id="confirm-delete-subnote">${icon('trash')} Excluir subnota</button>`);
-  $('#confirm-delete-subnote').onclick=async()=>{try{await del(`/api/notes/${id}`);state.openTabs=state.openTabs.filter(t=>t.id!==Number(id));block?.remove();closeModal();if(state.active?.id===Number(parentId)){const editor=$('#notion-content');editor?.dispatchEvent(new Event('input',{bubbles:true}));await saveNotionPage(Number(parentId),true);state.active=await get(`/api/notes/${parentId}`);}toast('Subnota excluída.','ok');}catch(err){toast(err.message,'err');}};
+  $('#confirm-delete-subnote').onclick=async()=>{try{await del(`/api/notes/${id}`);state.openTabs=state.openTabs.filter(t=>t.id!==Number(id));block?.remove();closeModal();if(state.active?.id===Number(parentId)){const editor=$('#notion-content');editor?.dispatchEvent(new Event('input',{bubbles:true}));await saveNotionPage(Number(parentId),true,{force:true});state.active=materializeSessionNote(await get(`/api/notes/${parentId}`));}toast('Subnota excluída.','ok');}catch(err){toast(err.message,'err');}};
 }
 function openExportModal(id){
   const formats=[['pdf','PDF'],['docx','Word (.docx)'],['html','HTML'],['md','Markdown'],['rtf','RTF'],['txt','Texto (.txt)'],['json','JSON']];
   modal('Exportar anotação',`<div class="export-format-grid">${formats.map(([fmt,label])=>`<button class="export-format" data-export-format="${fmt}">${icon(fmt==='pdf'?'document':'export')}<span>${label}</span></button>`).join('')}</div><p class="settings-help">PDF e Word exportam uma cópia independente. HTML preserva melhor a formatação rica; TXT, Markdown, RTF e JSON servem para edição e interoperabilidade.</p>`,`<button class="btn soft" data-close>Cancelar</button>`,'export-note-modal');
-  $$('[data-export-format]').forEach(b=>b.onclick=async()=>{try{if(state.active?.id===Number(id)&&state.noteDirty)await saveNotionPage(Number(id),true);const result=await window.pywebview?.api?.export_note?.(Number(id),b.dataset.exportFormat);if(result?.ok){closeModal();toast(`Anotação exportada em ${String(result.format||'').toUpperCase()}.`,'ok');}else if(result?.error)toast(result.error,'err');}catch(err){toast(err.message,'err');}});
+  $$('[data-export-format]').forEach(b=>b.onclick=async()=>{try{if(state.active?.id===Number(id)&&noteSessions.get(Number(id))?.dirty){const saved=await saveNotionPage(Number(id),false,{force:true});if(!saved)return toast('A exportação foi cancelada porque ainda existem alterações pendentes.','err');}const result=await window.pywebview?.api?.export_note?.(Number(id),b.dataset.exportFormat);if(result?.ok){closeModal();toast(`Anotação exportada em ${String(result.format||'').toUpperCase()}.`,'ok');}else if(result?.error)toast(result.error,'err');}catch(err){toast(err.message,'err');}});
 }
 function confirmDeleteNote(id){const current=state.active?.id===Number(id)?state.active:null;const parentId=current?.parent_note_id||current?.parent_note?.id||null;const isSub=!!parentId;modal(isSub?'Excluir subnota':'Excluir anotação',`<p>${isSub?'Essa subnota':'Essa anotação'} será removida do Reposit+.</p>`,`<button class="btn soft" data-close>Cancelar</button><button class="btn danger" id="confirm-delete">${icon('trash')} Excluir</button>`);$('#confirm-delete').onclick=async()=>{try{await del(`/api/notes/${id}`);state.selected.delete(id);state.openTabs=state.openTabs.filter(t=>t.id!==Number(id));state.active=null;closeModal();toast(isSub?'Subnota excluída.':'Nota excluída.','ok');if(parentId)await openNote(Number(parentId));else await renderWorkspace();}catch(err){toast(err.message,'err');}};}
 function confirmDeleteMany(ids){modal('Excluir anotações',`<p>${ids.length} anotações serão removidas permanentemente.</p>`,`<button class="btn soft" data-close>Cancelar</button><button class="btn danger" id="confirm-delete-many">Excluir ${ids.length}</button>`);$('#confirm-delete-many').onclick=async()=>{try{for(const id of ids)await del(`/api/notes/${id}`);ids.forEach(id=>{state.selected.delete(id);state.openTabs=state.openTabs.filter(t=>t.id!==Number(id));});closeModal();toast('Anotações excluídas.','ok');await renderWorkspace();}catch(err){toast(err.message,'err');}};}
 
 async function handleFiles(files){
   if(!files.length)return;
+  let targetId=Number(pendingAttachmentNoteId||state.active?.id||0);pendingAttachmentNoteId=null;
   for(const file of files){
     try{
-      let note=state.active;
-      if(!note){const title=file.name.replace(/\.[^.]+$/,'');note=await post('/api/notes',{title,kind:'Material',content:'',tags:''});state.active=note;ensureNoteTab(note);renderNotionPage();}
+      let note=targetId?(state.active?.id===targetId?state.active:await get(`/api/notes/${targetId}`)):null;
+      if(!note){const title=file.name.replace(/\.[^.]+$/,'');note=await post('/api/notes',{title,kind:'Material',content:'',tags:''});targetId=Number(note.id);state.active=note;ensureNoteTab(note);renderNotionPage();}
       const fd=new FormData();fd.append('file',file);const uploaded=await form(`/api/notes/${note.id}/files`,fd);
-      if(state.active?.id===note.id){state.active=await get(`/api/notes/${note.id}`);placeAttachmentAtCaret($('#notion-content'),uploaded);await saveNotionPage(note.id,true);}
+      if(state.active?.id===Number(note.id)){
+        const fresh=await get(`/api/notes/${note.id}`);state.active=materializeSessionNote(fresh);
+        selectionManager.restore(note.id);placeAttachmentAtCaret($('#notion-content'),uploaded);bindInlineAttachments(state.active);
+        await saveNotionPage(note.id,true,{force:true});
+      }
     }catch(err){toast(`${file.name}: ${err.message}`,'err');}
   }
-  $('#global-file-picker').value='';await loadNotes();if(state.active){state.active=await get(`/api/notes/${state.active.id}`);renderNotionPage();}
+  const picker=$('#global-file-picker');if(picker)picker.value='';await loadNotes();
 }
 
 
@@ -769,7 +969,7 @@ async function renderSettings(section=''){
 function renderSettingsPane(){
   const pane=$('#settings-pane');if(!pane)return;const tab=state.settingsTab;
   if(tab==='general')pane.innerHTML=`<div class="settings-pane-head"><span class="settings-accent violet"></span><div><h2>Geral e desempenho</h2><p>Interface única, consistente e equilibrada para uso diário.</p></div></div><div class="settings-form"><label class="settings-switch"><span><strong>Salvamento automático</strong><small>Quando desligado, alterações ficam marcadas até Ctrl+S.</small></span><input id="autosave-enabled" type="checkbox" ${state.settings.autosave_enabled?'checked':''}></label><label class="settings-switch"><span><strong>Economia de bateria</strong><small>Reduz animações e atividade em segundo plano quando você preferir.</small></span><input id="battery-saver" type="checkbox" ${state.settings.battery_saver?'checked':''}></label></div>`;
-  if(tab==='shortcuts')pane.innerHTML=`<div class="settings-pane-head"><span class="settings-accent green"></span><div><h2>Atalhos</h2><p>Comandos principais.</p></div></div><div class="shortcut-grid">${[['Ctrl + N','Nova nota'],['Ctrl + S','Salvar agora'],['Ctrl + F / K / P','Pesquisar'],['Ctrl + Tab','Próxima nota'],['Ctrl + Shift + Tab','Nota anterior'],['Ctrl + W','Fechar nota'],['Ctrl + 1…9','Ir para aba'],['Ctrl + D','Duplicar nota'],['F2','Renomear'],['Delete','Excluir'],['Ctrl + Alt','Abrir Quick'],['Ctrl + Alt + Espaço','Quick alternativo'],['Esc','Fechar Quick/menu']].map(([k,v])=>`<div><kbd>${k}</kbd><span>${v}</span></div>`).join('')}</div>`;
+  if(tab==='shortcuts')pane.innerHTML=`<div class="settings-pane-head"><span class="settings-accent green"></span><div><h2>Atalhos</h2><p>Comandos principais.</p></div></div><div class="shortcut-grid">${[['Ctrl + N','Nova nota'],['Ctrl + S','Salvar agora'],['Ctrl + F','Buscar nesta nota'],['Ctrl + Shift + F / Ctrl + P','Pesquisar notas'],['Ctrl + K','Inserir link'],['Ctrl + Tab','Próxima nota'],['Ctrl + Shift + Tab','Nota anterior'],['Ctrl + W','Fechar nota'],['Ctrl + 1…9','Ir para aba'],['Ctrl + D','Duplicar nota'],['F2','Renomear'],['Delete','Excluir'],['Left Ctrl + Left Alt','Abrir/fechar Quick'],['Esc','Fechar Quick/menu']].map(([k,v])=>`<div><kbd>${k}</kbd><span>${v}</span></div>`).join('')}</div>`;
   if(tab==='backup')pane.innerHTML=`<div class="settings-pane-head"><span class="settings-accent green"></span><div><h2>Backup</h2><p>Banco, configurações e anexos em um arquivo .reposit.</p></div></div><div class="backup-actions"><button class="btn primary" id="export-backup">${icon('download')} Exportar</button><button class="btn soft" id="import-backup">${icon('upload')} Importar</button></div>`;
   if(tab==='about'){const info=state.appInfo||{},st=state.storage||{};pane.innerHTML=`<div class="settings-pane-head"><span class="settings-accent violet"></span><div><h2>Sobre e armazenamento</h2><p>Uso local do Reposit+.</p></div></div><div class="about-app-card"><div class="about-app-mark">R+</div><div class="grow"><strong>Reposit+ ${esc(info.version||'')}</strong><span>${esc(info.distribution_label||'Aplicativo')}</span></div><span class="about-build-chip">v${esc(info.version||'')}</span></div><div class="storage-grid"><div><small>Banco</small><strong>${humanSize(st.database||0)}</strong></div><div><small>Anexos</small><strong>${humanSize(st.attachments||0)}</strong></div><div><small>Cache</small><strong>${humanSize(st.cache||0)}</strong></div><div><small>Total</small><strong>${humanSize(st.total||0)}</strong></div></div>${st.database_warning?'<div class="storage-warning">O banco local passou de aproximadamente 1 GB. Rode a manutenção.</div>':''}<div class="about-info-grid"><div><small>Dados do usuário</small><strong class="path-value">${esc(info.data_path||'-')}</strong></div><div><small>Ícones</small><strong>Windows · Segoe Fluent/MDL2</strong></div></div><div class="about-actions"><button class="btn soft" id="open-data-folder">${icon('folder-open')} Abrir pasta</button><button class="btn soft" id="run-maintenance">Manutenção do banco</button></div>`;}
   bindSettingsAutosave();
@@ -779,7 +979,7 @@ function settingsSaving(text='Salvando…'){$('#settings-save-state')&&($('#sett
 let settingsSaveTimer=null;
 function scheduleSettingsSave(fn){settingsSaving();clearTimeout(settingsSaveTimer);settingsSaveTimer=setTimeout(async()=>{try{await fn();settingsSaving('Configurações salvas');}catch(err){settingsSaving('Erro ao salvar');toast(err.message,'err');}},420);}
 function bindSettingsAutosave(){
-  $('#autosave-enabled')?.addEventListener('change',e=>scheduleSettingsSave(async()=>{state.settings=await patch('/api/settings',{autosave_enabled:e.target.checked});}));
+  $('#autosave-enabled')?.addEventListener('change',e=>scheduleSettingsSave(async()=>{state.settings=await patch('/api/settings',{autosave_enabled:e.target.checked});if(state.settings.autosave_enabled){noteSessions.forEach(session=>{if(session.dirty)scheduleNoteSave(session.id,120);});}else{noteSessions.forEach(session=>{if(session.timer){clearTimeout(session.timer);session.timer=null;}});}if(state.active?.id)syncSaveUi(state.active.id);}));
   $('#battery-saver')?.addEventListener('change',e=>scheduleSettingsSave(async()=>{state.settings=await patch('/api/settings',{battery_saver:e.target.checked});applyUiPreferences();}));
   $('#open-data-folder')?.addEventListener('click',async()=>{const r=await window.pywebview?.api?.open_data_folder();if(r?.error)toast(r.error,'err');});
   $('#run-maintenance')?.addEventListener('click',async()=>{try{const r=await post('/api/storage/maintenance',{force:false});state.storage=r.storage;toast('Manutenção concluída sem tocar nos seus anexos.','ok');renderSettingsPane();}catch(err){toast(err.message,'err');}});
@@ -787,7 +987,12 @@ function bindSettingsAutosave(){
   $('#import-backup')?.addEventListener('click',async()=>{try{const r=await window.pywebview?.api?.import_backup();if(r?.ok)toast('Backup importado. Reinicie o app.','ok');else if(r?.error)toast(r.error,'err');}catch(err){toast(err.message,'err');}});
 }
 
-window.addEventListener('beforeunload',event=>{if(state.noteDirty&&!state.settings.autosave_enabled){event.preventDefault();event.returnValue='';}});
+window.addEventListener('beforeunload',event=>{
+  if(state.active?.id&&$('#notion-content'))captureNoteRevision(state.active.id);
+  noteSessions.forEach(session=>{if(session.dirty)persistNoteDraft(session);});
+  if(hasPendingNoteChanges()){event.preventDefault();event.returnValue='';}
+});
+window.addEventListener('pagehide',()=>{if(state.active?.id&&$('#notion-content'))captureNoteRevision(state.active.id);noteSessions.forEach(session=>{if(session.dirty)persistNoteDraft(session);});});
 window.addEventListener('error', event => {
   console.error('Reposit+ frontend error:', event.error || event.message);
 });

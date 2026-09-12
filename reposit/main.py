@@ -22,7 +22,7 @@ from reposit.backend.backups import export_reposit, import_reposit
 from reposit.backend.config import APP_NAME, APP_VERSION, AppPaths, load_identity, load_settings, save_settings
 from reposit.backend.database import Database
 from reposit.backend.note_export import EXPORT_FORMATS, safe_filename, write_note_export
-from reposit.quick import QuickManager, QuickStateStore
+from reposit.quick import QuickHotkey, QuickManager, QuickStateStore
 from reposit.quick.win32 import enable_per_monitor_v2
 
 def _local_appdata_root() -> Path:
@@ -401,7 +401,7 @@ class DesktopRuntime:
         self.force_exit = False
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
-        self._keyboard = None
+        self.quick_hotkey = QuickHotkey(self.toggle_quick, self.log)
         self._webview_stopped = threading.Event()
         self.base_url = ""
         self.memory_governor = WindowsMemoryGovernor(
@@ -445,49 +445,20 @@ class DesktopRuntime:
         raise RuntimeError("API local não iniciou.")
 
     def register_hotkey(self) -> None:
-        try:
-            import keyboard
-            self._keyboard = keyboard
-            self._hotkey_last = 0.0
+        """Register the real global Left Ctrl + Left Alt Quick toggle.
 
-            def maybe_toggle(_event=None):
-                try:
-                    if not (keyboard.is_pressed("left ctrl") and keyboard.is_pressed("left alt")):
-                        return
-                    now = time.monotonic()
-                    # Both modifier hooks may fire for the same press. Keep only a tiny
-                    # dedupe window so intentional rapid toggles still work.
-                    if now - self._hotkey_last < 0.18:
-                        return
-                    self._hotkey_last = now
-                    self.log.info("Atalho global acionado: left ctrl + left alt")
-                    self.toggle_quick()
-                except Exception as exc:
-                    self.log.warning("Falha ao processar atalho global: %s", exc)
-
-            keyboard.on_press_key("left alt", maybe_toggle, suppress=False)
-            keyboard.on_press_key("left ctrl", maybe_toggle, suppress=False)
-            keyboard.add_hotkey(
-                "ctrl+alt+space",
-                self.show_quick,
-                suppress=False,
-                trigger_on_release=False,
-            )
-            self.log.info("Atalho global registrado: left ctrl + left alt; fallback ctrl+alt+space")
-        except Exception as exc:
-            self.log.warning("Atalho global indisponível: %s", exc)
+        QuickHotkey deliberately checks the physical sided modifiers with
+        keyboard.is_pressed instead of trusting event.name. Windows can report
+        the same keys as ctrl/alt/left menu depending on layout/backend.
+        """
+        if self.quick_hotkey.start():
+            self.log.info("Atalho global registrado: left ctrl + left alt")
 
     def toggle_quick(self) -> None:
         try:
             self.quick.toggle()
         except Exception as exc:
             self.log.warning("Falha ao alternar Reposit+ Quick: %s", exc)
-
-    def show_quick(self) -> None:
-        try:
-            self.quick.show()
-        except Exception as exc:
-            self.log.warning("Falha ao abrir Reposit+ Quick: %s", exc)
 
     def on_main_loaded(self):
         self.log.info("Interface HTML carregada pelo pywebview")
@@ -511,15 +482,10 @@ class DesktopRuntime:
                 self.server.force_exit = True
             except Exception:
                 pass
-        if self._keyboard:
-            try:
-                self._keyboard.unhook_all_hotkeys()
-            except Exception:
-                pass
-            try:
-                self._keyboard.unhook_all()
-            except Exception:
-                pass
+        try:
+            self.quick_hotkey.stop()
+        except Exception:
+            pass
         try:
             self.db.checkpoint()
         except Exception:
