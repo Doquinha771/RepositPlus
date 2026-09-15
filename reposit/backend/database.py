@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 10
 
 
 def utcnow() -> str:
@@ -22,6 +22,7 @@ class Database:
         self._local = threading.local()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.last_recovery: dict[str, Any] | None = None
+        self.last_migration_backup: str | None = None
         self._recover_if_corrupt()
         self.migrate()
 
@@ -42,18 +43,30 @@ class Database:
             return False, str(exc)
 
     def _bootstrap_empty_database(self) -> None:
-        """Create the current schema without recursing through __init__."""
+        """Create the current schema atomically without recursing through __init__."""
         conn = sqlite3.connect(self.path, timeout=20)
         try:
             conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("BEGIN IMMEDIATE")
             self._migration_1(conn)
             self._migration_2(conn)
             self._migration_3(conn)
             self._migration_4(conn)
             self._migration_5(conn)
             self._migration_6(conn)
+            self._migration_7(conn)
+            self._migration_8(conn)
+            self._migration_9(conn)
+            self._migration_10(conn)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                sample = ", ".join(str(tuple(row)) for row in violations[:5])
+                raise RuntimeError(f"Bootstrap criaria relações inválidas: {sample}")
             conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -203,9 +216,73 @@ class Database:
         finally:
             conn.close()
 
+    def _backup_before_migration(self, from_version: int) -> Path | None:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return None
+        backup_dir = self.path.parent / "migration-backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup = backup_dir / f"{self.path.stem}.v{from_version}-before-v{CURRENT_SCHEMA_VERSION}-{stamp}{self.path.suffix}"
+        source = sqlite3.connect(self.path, timeout=20)
+        target = sqlite3.connect(backup, timeout=20)
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
+            source.close()
+        self.last_migration_backup = str(backup)
+        # Keep migration safety bounded. Five known-good snapshots are enough;
+        # infinite backups are just a disk leak wearing a safety badge.
+        candidates = sorted(backup_dir.glob(f"{self.path.stem}.v*-before-v*{self.path.suffix}"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in candidates[5:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        return backup
+
+
+    @staticmethod
+    def _executescript_atomic(conn: sqlite3.Connection, script: str) -> None:
+        """Execute a SQL script without sqlite3.executescript's implicit COMMIT.
+
+        Migrations are wrapped by one explicit transaction in ``migrate``.
+        ``sqlite3.Connection.executescript`` commits a pending transaction before
+        running its script, which can leave half-migrated schemas behind when a
+        later migration fails.  Split only at SQLite-complete statement
+        boundaries and execute each statement through ``execute`` instead.
+        """
+        statement = ""
+        for char in str(script):
+            statement += char
+            if char == ";" and sqlite3.complete_statement(statement):
+                sql = statement.strip()
+                statement = ""
+                if sql:
+                    conn.execute(sql)
+        tail = statement.strip()
+        if tail:
+            if not sqlite3.complete_statement(tail + ";"):
+                raise sqlite3.OperationalError("SQL de migration incompleto")
+            conn.execute(tail)
+
     def migrate(self) -> None:
+        probe = sqlite3.connect(self.path, timeout=20)
+        try:
+            version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            probe.close()
+        if version > CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(f"Banco usa schema v{version}, mais novo que o suportado v{CURRENT_SCHEMA_VERSION}.")
+        if version < CURRENT_SCHEMA_VERSION:
+            self._backup_before_migration(version)
         with self.session() as conn:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            # Foreign-key mode must be selected before BEGIN.  Migrations may
+            # rebuild referenced lookup tables, then we validate all relations
+            # before the single transaction is allowed to commit.
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("BEGIN IMMEDIATE")
             if version < 1:
                 self._migration_1(conn)
                 version = 1
@@ -224,10 +301,26 @@ class Database:
             if version < 6:
                 self._migration_6(conn)
                 version = 6
+            if version < 7:
+                self._migration_7(conn)
+                version = 7
+            if version < 8:
+                self._migration_8(conn)
+                version = 8
+            if version < 9:
+                self._migration_9(conn)
+                version = 9
+            if version < 10:
+                self._migration_10(conn)
+                version = 10
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                sample = ", ".join(str(tuple(row)) for row in violations[:5])
+                raise RuntimeError(f"Migration criaria relações inválidas: {sample}")
             conn.execute(f"PRAGMA user_version={version}")
 
     def _migration_1(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(
+        self._executescript_atomic(conn, 
             """
 
             CREATE TABLE IF NOT EXISTS repositories (
@@ -362,7 +455,7 @@ class Database:
 
 
     def _migration_2(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(
+        self._executescript_atomic(conn, 
             """
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -423,7 +516,7 @@ class Database:
 
     def _migration_4(self, conn: sqlite3.Connection) -> None:
         """0.7.0: indexes used by lazy note lists and maintenance-friendly queries."""
-        conn.executescript(
+        self._executescript_atomic(conn, 
             """
             CREATE INDEX IF NOT EXISTS idx_notes_parent_updated ON notes(parent_note_id, pinned DESC, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_notes_kind_updated ON notes(kind, updated_at DESC);
@@ -432,7 +525,6 @@ class Database:
 
     def _migration_5(self, conn: sqlite3.Connection) -> None:
         """0.7 cleanup: retire account/mail/profile data from the active database."""
-        conn.execute("PRAGMA foreign_keys=OFF")
         for table in ("profile", "contacts", "email_history"):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         teacher_columns = {row[1] for row in conn.execute("PRAGMA table_info(teachers)").fetchall()}
@@ -441,13 +533,12 @@ class Database:
                 conn.execute("ALTER TABLE teachers DROP COLUMN email")
             except sqlite3.DatabaseError:
                 # Compatibility path for older SQLite: rebuild the tiny lookup table.
-                conn.executescript("""
+                self._executescript_atomic(conn, """
                     CREATE TABLE teachers_v5 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
                     INSERT OR IGNORE INTO teachers_v5(id,name) SELECT id,name FROM teachers;
                     DROP TABLE teachers;
                     ALTER TABLE teachers_v5 RENAME TO teachers;
                 """)
-        conn.execute("PRAGMA foreign_keys=ON")
 
     def _migration_6(self, conn: sqlite3.Connection) -> None:
         """0.7.1 Pré-2: monotonic editor revisions used by conflict-safe autosave."""
@@ -456,11 +547,208 @@ class Database:
             conn.execute("ALTER TABLE notes ADD COLUMN edit_revision INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_revision ON notes(id, edit_revision)")
 
+    def _migration_7(self, conn: sqlite3.Connection) -> None:
+        """0.7.2: staged attachment reconciliation and safe two-phase deletion metadata."""
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS note_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                filepath TEXT NOT NULL,
+                file_type TEXT NOT NULL DEFAULT '',
+                file_hash TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                confirmed_revision INTEGER NOT NULL DEFAULT 0,
+                deleted_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+            )"""
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(note_files)").fetchall()}
+        if "state" not in columns:
+            conn.execute("ALTER TABLE note_files ADD COLUMN state TEXT NOT NULL DEFAULT 'active'")
+        if "confirmed_revision" not in columns:
+            conn.execute("ALTER TABLE note_files ADD COLUMN confirmed_revision INTEGER NOT NULL DEFAULT 0")
+        if "deleted_at" not in columns:
+            conn.execute("ALTER TABLE note_files ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE note_files SET state='active' WHERE state IS NULL OR state='' ")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_note_files_state ON note_files(note_id, state)")
+
+
+    def _migration_8(self, conn: sqlite3.Connection) -> None:
+        """0.7.3: workspace/search longevity indexes only.
+
+        Keep this migration deliberately boring: no table rewrites, no content
+        conversion and no new hard dependency. FTS already exists from schema v2.
+        """
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_title_nocase ON notes(title COLLATE NOCASE)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_updated_parent ON notes(parent_note_id, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_pinned_updated ON notes(pinned DESC, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_note_files_note_state ON note_files(note_id, state)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_note_files_filepath ON note_files(filepath)")
+
+
+    def _migration_9(self, conn: sqlite3.Connection) -> None:
+        """0.7.4: productivity metadata, trash, templates and bounded note history.
+
+        This migration deliberately avoids rewriting note content. New columns are
+        additive so 0.7.0-0.7.3 data opens without manual conversion.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+        additions = {
+            "favorite": "INTEGER NOT NULL DEFAULT 0",
+            "trashed_at": "TEXT NOT NULL DEFAULT ''",
+            "manual_order": "REAL NOT NULL DEFAULT 0",
+            "last_opened_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE notes ADD COLUMN {name} {definition}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_trash_updated ON notes(trashed_at, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_favorite_updated ON notes(favorite DESC, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_recent ON notes(last_opened_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_manual_order ON notes(manual_order, id)")
+
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS note_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'Anotação',
+                content TEXT NOT NULL DEFAULT '',
+                content_format TEXT NOT NULL DEFAULT 'plain',
+                tags TEXT NOT NULL DEFAULT '',
+                edit_revision INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT 'autosave',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_note_history_note_created ON note_history(note_id, created_at DESC, id DESC)")
+
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS note_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL DEFAULT 'Anotação',
+                content TEXT NOT NULL DEFAULT '',
+                content_format TEXT NOT NULL DEFAULT 'html',
+                tags TEXT NOT NULL DEFAULT '',
+                builtin INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        now = utcnow()
+        templates = [
+            ("Em branco", "Anotação", "", "html", "", 1),
+            ("Atividade", "Atividade", "<h2>Objetivo</h2><p><br></p><h2>Desenvolvimento</h2><p><br></p><h2>Entrega</h2><p><br></p>", "html", "", 1),
+            ("Resumo", "Resumo", "<h2>Resumo</h2><p><br></p><h2>Pontos principais</h2><ul><li><br></li></ul>", "html", "", 1),
+            ("Anotação de aula", "Anotação", "<h2>Tópicos</h2><p><br></p><h2>Anotações</h2><p><br></p><h2>Dúvidas</h2><p><br></p>", "html", "", 1),
+            ("Projeto", "Projeto", "<h2>Objetivo</h2><p><br></p><h2>Etapas</h2><div class=\"reposit-checklist\"><p data-check-item=\"0\">☐ Planejar</p><p data-check-item=\"0\">☐ Executar</p><p data-check-item=\"0\">☐ Revisar</p></div>", "html", "", 1),
+            ("Checklist", "Checklist", "<div class=\"reposit-checklist\"><p data-check-item=\"0\">☐ Novo item</p></div>", "html", "", 1),
+        ]
+        for name, kind, content, fmt, tags, builtin in templates:
+            conn.execute(
+                "INSERT OR IGNORE INTO note_templates(name,kind,content,content_format,tags,builtin,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (name, kind, content, fmt, tags, builtin, now, now),
+            )
+
+    def _migration_10(self, conn: sqlite3.Connection) -> None:
+        """0.7.4.1: compatibility metadata for safe future upgrades.
+
+        This is intentionally metadata-only.  The editor content format remains
+        untouched so 0.8.0 can detect what it is opening without 0.7.4.1 trying
+        to perform the structural editor migration early.
+        """
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        now = utcnow()
+        metadata = {
+            "schema_version": str(CURRENT_SCHEMA_VERSION),
+            "content_format": "html-tokens-v1",
+            "editor_core": "legacy-contenteditable",
+            "migration_family": "0.7.x",
+        }
+        for key, value in metadata.items():
+            conn.execute(
+                "INSERT INTO app_metadata(key,value,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, value, now),
+            )
+
+    def startup_health_check(self) -> dict[str, Any]:
+        """Cheap startup validation; full integrity_check stays on-demand.
+
+        We validate schema, a one-page quick_check and the handful of tables the
+        runtime cannot function without.  This avoids a heavyweight scan on
+        every boot while still detecting a half-migrated or obviously corrupt DB.
+        """
+        conn = self.connect()
+        try:
+            schema = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            quick = str(conn.execute("PRAGMA quick_check(1)").fetchone()[0])
+            names = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('notes','note_files','note_fts','app_metadata')"
+                ).fetchall()
+            }
+            required = {"notes", "note_files", "note_fts", "app_metadata"}
+            missing = sorted(required - names)
+            ok = schema == CURRENT_SCHEMA_VERSION and quick.lower() == "ok" and not missing
+            return {"ok": ok, "schema_version": schema, "quick_check": quick, "missing_tables": missing}
+        finally:
+            conn.close()
+
+    def set_metadata(self, key: str, value: str) -> None:
+        key = str(key or "").strip()[:80]
+        if not key:
+            raise ValueError("Metadata key is required")
+        self.execute(
+            "INSERT INTO app_metadata(key,value,updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            (key, str(value or "")[:500], utcnow()),
+        )
+
+    def get_metadata(self) -> dict[str, str]:
+        return {str(r["key"]): str(r["value"]) for r in self.fetchall("SELECT key,value FROM app_metadata ORDER BY key")}
+
+    def integrity_check(self) -> dict[str, Any]:
+        """Run SQLite's full integrity check on demand, never on every startup."""
+        conn = self.connect()
+        try:
+            rows = [str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()]
+            ok = len(rows) == 1 and rows[0].lower() == "ok"
+            fk = [tuple(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()]
+            return {"ok": bool(ok and not fk), "integrity": rows, "foreign_keys": fk[:100]}
+        finally:
+            conn.close()
+
     def maintenance(self, force: bool = False) -> dict[str, Any]:
         """Run cheap SQLite upkeep. VACUUM is reserved for explicit/large cleanup."""
         before = self.path.stat().st_size if self.path.exists() else 0
         conn = self.connect()
         try:
+            # History is already capped per note at write time.  This global cap
+            # prevents thousands of barely-used notes from retaining 25 large
+            # snapshots forever. Keep newest 10k snapshots across the database.
+            try:
+                history_count = int(conn.execute("SELECT COUNT(*) FROM note_history").fetchone()[0])
+                if history_count > 10000:
+                    conn.execute(
+                        "DELETE FROM note_history WHERE id IN (SELECT id FROM note_history ORDER BY id ASC LIMIT ?)",
+                        (history_count - 10000,),
+                    )
+                    conn.commit()
+            except sqlite3.OperationalError:
+                history_count = 0
             conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             conn.execute("PRAGMA optimize")
             freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
@@ -476,7 +764,7 @@ class Database:
             finally:
                 conn.close()
         after = self.path.stat().st_size if self.path.exists() else 0
-        return {"ok": True, "before": before, "after": after, "vacuumed": vacuumed, "free_pages": freelist, "pages": pages}
+        return {"ok": True, "before": before, "after": after, "vacuumed": vacuumed, "free_pages": freelist, "pages": pages, "history_snapshots": min(history_count, 10000)}
 
     def checkpoint(self) -> None:
         """Move alterações do WAL para o arquivo principal antes de backup/cópia."""

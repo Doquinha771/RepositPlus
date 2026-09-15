@@ -18,10 +18,14 @@ import uvicorn
 import webview
 
 from reposit.backend.api import AppState, create_app
-from reposit.backend.backups import export_reposit, import_reposit
+from reposit.backend.backups import create_automatic_backup, export_reposit, import_reposit
 from reposit.backend.config import APP_NAME, APP_VERSION, AppPaths, load_identity, load_settings, save_settings
 from reposit.backend.database import Database
-from reposit.backend.note_export import EXPORT_FORMATS, safe_filename, write_note_export
+from reposit.backend.instance_lock import InstanceLock
+from reposit.backend.note_export import EXPORT_FORMATS, safe_filename, write_note_bundle, write_note_export
+from reposit.backend.diagnostics import export_diagnostics_bundle
+from reposit.backend.maintenance import clear_disposable_cache
+from reposit.backend.safe_mode import StartupGuard
 from reposit.quick import QuickHotkey, QuickManager, QuickStateStore
 from reposit.quick.win32 import enable_per_monitor_v2
 
@@ -92,7 +96,7 @@ def configure_logging() -> None:
     """Keep source builds verbose, but avoid constant disk/console churn in packaged student builds."""
     PATHS.logs.mkdir(parents=True, exist_ok=True)
     packaged = bool(getattr(sys, "frozen", False))
-    handlers: list[logging.Handler] = [RotatingFileHandler(PATHS.logs / "reposit.log", maxBytes=1_048_576, backupCount=2, encoding="utf-8")]
+    handlers: list[logging.Handler] = [RotatingFileHandler(PATHS.logs / "reposit.log", maxBytes=2_097_152, backupCount=5, encoding="utf-8")]
     if not packaged:
         handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
@@ -258,6 +262,47 @@ class NativeBridge:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def export_note_bundle(self, note_id: int) -> dict[str, Any]:
+        """Export one HTML copy plus referenced local attachments without mutating originals."""
+        try:
+            note = self.db.fetchone("SELECT * FROM notes WHERE id=?", (int(note_id),))
+            if not note:
+                return {"ok": False, "error": "Anotação não encontrada."}
+            files = self.db.fetchall(
+                "SELECT id,filename,filepath,file_type,size,created_at,state FROM note_files WHERE note_id=? AND state!='pending_delete' ORDER BY id",
+                (int(note_id),),
+            )
+            filename = safe_filename(str(note.get("title") or "Anotacao")) + "-com-arquivos.zip"
+            result = self.main_window.create_file_dialog(
+                self._dialog_type("save"), save_filename=filename,
+                file_types=("Arquivo ZIP (*.zip)", "Todos os arquivos (*.*)"),
+            )
+            if not result:
+                return {"ok": False, "cancelled": True}
+            chosen = Path(result[0] if isinstance(result, (list, tuple)) else result)
+            written = write_note_bundle(dict(note), files, chosen)
+            return {"ok": True, "path": str(written), "format": "zip", "files": len(files)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def export_diagnostics(self) -> dict[str, Any]:
+        """Create a support bundle that never includes note contents or attachments."""
+        try:
+            if not self.main_window:
+                return {"ok": False, "error": "Janela indisponível."}
+            result = self.main_window.create_file_dialog(
+                self._dialog_type("save"),
+                save_filename=f"RepositPlus-{APP_VERSION}-diagnostico.zip",
+                file_types=("Arquivo ZIP (*.zip)", "Todos os arquivos (*.*)"),
+            )
+            if not result:
+                return {"ok": False, "cancelled": True}
+            chosen = Path(result[0] if isinstance(result, (list, tuple)) else result)
+            written = export_diagnostics_bundle(self.db, self.paths, chosen)
+            return {"ok": True, "path": str(written)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def close_main(self) -> None:
         if self.main_window:
             self.main_window.destroy()
@@ -280,6 +325,8 @@ class NativeBridge:
             self.show_main,
             self.open_note,
             self.export_note,
+            self.export_note_bundle,
+            self.export_diagnostics,
         )
 
 
@@ -305,6 +352,10 @@ class WindowsMemoryGovernor:
 
     def stop(self) -> None:
         self._stop.set()
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        self._thread = None
 
     def _loop(self) -> None:
         # A minute between probes keeps idle CPU effectively at zero. Forced
@@ -388,12 +439,37 @@ class DesktopRuntime:
         self.settings = load_settings(PATHS)
         if self.settings.get("device_name"):
             self.identity["device_name"] = self.settings["device_name"]
+        self._assert_writable_data_root()
+        self.instance_lock = InstanceLock(PATHS.data / "instance.lock")
+        if not self.instance_lock.acquire():
+            raise RuntimeError("O Reposit+ já está aberto usando esta pasta de dados.")
+        self.startup_guard = StartupGuard(
+            PATHS.data / "startup-state.json",
+            forced="--safe-mode" in sys.argv,
+            auto_enabled=bool(self.settings.get("safe_mode_auto", True)),
+        )
+        self.startup_guard.begin()
+        self.safe_mode = bool(self.startup_guard.safe_mode)
+        if self.safe_mode:
+            # Runtime-only overrides. Never rewrite the user's normal choices.
+            self.settings = dict(self.settings)
+            self.settings["restore_workspace"] = False
+            try:
+                clear_disposable_cache(PATHS)
+            except Exception:
+                pass
         self.db = Database(PATHS.db)
-        self._run_startup_maintenance()
+        self.startup_health = self.db.startup_health_check()
+        if not self.startup_health.get("ok"):
+            raise RuntimeError(f"O banco não passou na verificação rápida de inicialização: {self.startup_health}")
+        self.db.set_metadata("app_version", APP_VERSION)
         self.port = free_port()
         self.state = AppState(PATHS, self.db, self.settings, self.identity, self.port, "portable" if PORTABLE_MODE else ("installed" if getattr(sys, "frozen", False) else "source"))
+        self.state.safe_mode = self.safe_mode
+        self.state.startup_health = self.startup_health
         self.app = create_app(self.state)
         self.server: uvicorn.Server | None = None
+        self._server_thread: threading.Thread | None = None
         self.bridge = NativeBridge(PATHS, self.db)
         self.quick = QuickManager(QuickStateStore(PATHS.data / "quick-state.json"))
         self.main_window = None
@@ -403,23 +479,46 @@ class DesktopRuntime:
         self._cleanup_lock = threading.Lock()
         self.quick_hotkey = QuickHotkey(self.toggle_quick, self.log)
         self._webview_stopped = threading.Event()
+        self._closing_started = threading.Event()
         self.base_url = ""
         self.memory_governor = WindowsMemoryGovernor(
             int(self.settings.get("memory_soft_limit_mb") or 192)
         )
 
 
+    @staticmethod
+    def _assert_writable_data_root() -> None:
+        probe = PATHS.data / ".write-test"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"A pasta de dados do Reposit+ não permite gravação: {PATHS.data}") from exc
+
     def _run_startup_maintenance(self) -> None:
-        """Perform bounded housekeeping at startup, never on an idle timer."""
+        """Deferred bounded housekeeping after the first visible UI paint."""
+        if self.safe_mode:
+            return
         now = time.time()
+        changed = False
         last = float(self.settings.get("last_db_maintenance") or 0)
         if now - last >= 7 * 24 * 60 * 60:
             try:
                 self.db.maintenance(force=False)
                 self.settings["last_db_maintenance"] = int(now)
-                save_settings(PATHS, self.settings)
+                changed = True
             except Exception:
-                logging.getLogger("reposit.runtime").warning("Falha na manutenção periódica do banco.", exc_info=True)
+                self.log.warning("Falha na manutenção periódica do banco.", exc_info=True)
+        last_backup = float(self.settings.get("last_auto_backup") or 0)
+        if now - last_backup >= 24 * 60 * 60:
+            try:
+                create_automatic_backup(PATHS, keep=5, include_attachments=True)
+                self.settings["last_auto_backup"] = int(now)
+                changed = True
+            except Exception:
+                self.log.warning("Falha no backup automático pós-startup.", exc_info=True)
+        if changed:
+            save_settings(PATHS, self.settings)
 
     def start_server(self) -> None:
         config = uvicorn.Config(
@@ -437,6 +536,7 @@ class DesktopRuntime:
         )
         self.server = uvicorn.Server(config)
         thread = threading.Thread(target=self.server.run, name="reposit-fastapi", daemon=True)
+        self._server_thread = thread
         thread.start()
         for _ in range(60):
             if self.server.started:
@@ -462,6 +562,7 @@ class DesktopRuntime:
 
     def on_main_loaded(self):
         self.log.info("Interface HTML carregada pelo pywebview")
+        threading.Thread(target=self._run_startup_maintenance, name="reposit-deferred-maintenance", daemon=True).start()
 
     def shutdown_runtime(self) -> None:
         """Stop every background component exactly once.
@@ -490,29 +591,58 @@ class DesktopRuntime:
             self.db.checkpoint()
         except Exception:
             pass
-
-    def on_closing(self):
-        self.force_exit = True
-        # pywebview only terminates after all windows are gone. The hidden Quick
-        # window counts, because apparently invisible windows still have opinions.
         try:
-            if self.quick_window:
-                self.quick_window.destroy()
+            self.instance_lock.release()
         except Exception:
             pass
+        try:
+            self.startup_guard.clean_exit()
+        except Exception:
+            pass
+        server_thread = self._server_thread
+        if server_thread and server_thread.is_alive() and server_thread is not threading.current_thread():
+            server_thread.join(timeout=1.0)
+
+    def on_closing(self):
+        """Allow the native main window to close immediately and safely.
+
+        The frontend persists drafts/workspace from ``beforeunload`` synchronously.
+        Do not wait for an async JavaScript Promise inside pywebview's blocking
+        ``closing`` event; doing so can freeze the native close path.
+        """
+        if self._closing_started.is_set():
+            return True
+        self._closing_started.set()
+        self.force_exit = True
         self.shutdown_runtime()
 
         def force_exit_if_webview_hangs():
-            if not self._webview_stopped.wait(2.5):
+            if not self._webview_stopped.wait(2.0):
                 os._exit(0)
 
         threading.Thread(target=force_exit_if_webview_hangs, name="reposit-exit-watchdog", daemon=True).start()
         return True
 
+    def on_main_closed(self):
+        """Destroy the persistent hidden Quick WebView after Main is gone.
+
+        pywebview keeps its GUI loop alive while any window exists, including a
+        hidden one. Destroying Quick from ``closed`` avoids re-entrant window
+        destruction inside the blocking ``closing`` callback.
+        """
+        try:
+            if self.quick_window:
+                self.quick_window.destroy()
+        except Exception:
+            pass
+        finally:
+            self.quick_window = None
+
+
     def run(self) -> None:
         enable_per_monitor_v2()
         enable_windows_energy_saver(bool(self.settings.get("battery_saver")))
-        self.log.info("Iniciando %s %s (%s)", APP_NAME, APP_VERSION, "portable" if PORTABLE_MODE else "installed/source")
+        self.log.info("Iniciando %s %s (%s%s)", APP_NAME, APP_VERSION, "portable" if PORTABLE_MODE else "installed/source", ", safe mode" if self.safe_mode else "")
         if os.name == "nt":
             args = [
                 "--disable-background-networking", "--disable-component-update", "--disable-sync",
@@ -531,7 +661,7 @@ class DesktopRuntime:
             self.base_url,
             width=1380,
             height=860,
-            min_size=(1050, 650),
+            min_size=(860, 540),
             background_color="#303236",
             confirm_close=False,
             frameless=False,
@@ -568,6 +698,7 @@ class DesktopRuntime:
         self.quick_window.expose(*self.quick.exposed_functions())
         self.quick_window.events.loaded += self.quick.mark_ready
         self.main_window.events.closing += self.on_closing
+        self.main_window.events.closed += self.on_main_closed
         self.main_window.events.loaded += self.on_main_loaded
         self.register_hotkey()
         # WebView2 needs a writable storage folder. Keeping it in AppData fixes

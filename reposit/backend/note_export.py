@@ -204,6 +204,29 @@ def safe_filename(value: str, fallback: str = "Anotacao") -> str:
     return (value[:120] or fallback)
 
 
+
+def write_note_bundle(note: dict[str, Any], files: list[dict[str, Any]], target: Path) -> Path:
+    """Write a portable HTML + attachments ZIP without mutating source files."""
+    target = Path(target)
+    if target.suffix.lower() != ".zip":
+        target = target.with_suffix(".zip")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("nota.html", note_html(note).encode("utf-8"))
+        for item in files:
+            source = Path(str(item.get("filepath") or ""))
+            if not source.is_file():
+                continue
+            base = safe_filename(str(item.get("filename") or source.name), fallback=f"arquivo-{item.get('id','x')}")
+            candidate = base
+            if candidate.casefold() in seen:
+                stem, suffix = Path(base).stem, Path(base).suffix
+                candidate = f"{stem}-{item.get('id','x')}{suffix}"
+            seen.add(candidate.casefold())
+            zf.write(source, f"arquivos/{candidate}")
+    return target
+
 def write_note_export(note: dict[str, Any], target: Path, fmt: str) -> Path:
     fmt = str(fmt or "txt").lower().lstrip(".")
     if fmt not in EXPORT_FORMATS:

@@ -1,47 +1,100 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import APP_VERSION, AppPaths
+from .database import CURRENT_SCHEMA_VERSION
+
+
+def _sqlite_snapshot(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(source, timeout=20)
+    dst = sqlite3.connect(destination, timeout=20)
+    try:
+        src.backup(dst)
+        dst.commit()
+    finally:
+        dst.close()
+        src.close()
+
+
+def _db_health(path: Path) -> dict[str, Any]:
+    conn = sqlite3.connect(path, timeout=10)
+    try:
+        integrity = [str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()]
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        fk = [tuple(row) for row in conn.execute("PRAGMA foreign_key_check").fetchall()]
+        return {
+            "ok": len(integrity) == 1 and integrity[0].lower() == "ok" and not fk,
+            "integrity": integrity,
+            "schema_version": version,
+            "foreign_keys": fk,
+        }
+    finally:
+        conn.close()
 
 
 def export_reposit(paths: AppPaths, destination: Path, include_attachments: bool = True) -> Path:
+    """Write an atomic .reposit archive from a consistent SQLite snapshot."""
     destination = destination.with_suffix(".reposit")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    tmp_archive = destination.with_suffix(destination.suffix + ".tmp")
+    tmp_archive.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="reposit-export-") as tmp_name:
+        snapshot = Path(tmp_name) / "REPOSITINFOS.db"
         if paths.db.exists():
-            zf.write(paths.db, "data/REPOSITINFOS.db")
-        if paths.settings.exists():
-            zf.write(paths.settings, "data/settings.json")
-        zf.writestr("manifest.json", json.dumps({"format": "reposit", "version": APP_VERSION}, ensure_ascii=False, indent=2))
-        if include_attachments:
-            for file in paths.attachments.rglob("*"):
-                if file.is_file() and paths.pending not in file.parents:
-                    zf.write(file, str(Path("attachments") / file.relative_to(paths.attachments)))
+            _sqlite_snapshot(paths.db, snapshot)
+        else:
+            sqlite3.connect(snapshot).close()
+        health = _db_health(snapshot)
+        if not health["ok"]:
+            raise ValueError("O banco atual não passou na verificação de integridade; backup automático foi cancelado.")
+        with zipfile.ZipFile(tmp_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(snapshot, "data/REPOSITINFOS.db")
+            if paths.settings.exists():
+                zf.write(paths.settings, "data/settings.json")
+            manifest = {
+                "format": "reposit",
+                "version": APP_VERSION,
+                "schema_version": health["schema_version"],
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "attachments": bool(include_attachments),
+            }
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            if include_attachments:
+                for file in paths.attachments.rglob("*"):
+                    if file.is_file() and paths.pending not in file.parents:
+                        zf.write(file, str(Path("attachments") / file.relative_to(paths.attachments)))
+    os.replace(tmp_archive, destination)
     return destination
 
 
-def _safe_zip_parts(name: str) -> tuple[str, ...]:
-    """Return normalized ZIP member parts or reject path traversal.
+def create_automatic_backup(paths: AppPaths, *, keep: int = 5, include_attachments: bool = True) -> Path:
+    paths.backups.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    target = paths.backups / f"RepositPlus-auto-{stamp}.reposit"
+    created = export_reposit(paths, target, include_attachments=include_attachments)
+    backups = sorted(paths.backups.glob("RepositPlus-auto-*.reposit"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in backups[max(1, int(keep)):]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    return created
 
-    ZIP member names are POSIX-style regardless of the host OS.  The old
-    validation resolved them against ``Path('/')`` and then checked for a
-    leading slash.  That works on POSIX, but on Windows ``Path('/').resolve()``
-    becomes something like ``C:\\``; consequently every perfectly valid
-    member was rejected.  Keep the validation platform-independent instead.
-    """
+
+def _safe_zip_parts(name: str) -> tuple[str, ...]:
     normalized = name.replace("\\", "/")
     member = PurePosixPath(normalized)
     parts = tuple(part for part in member.parts if part not in ("", "."))
-
-    # Absolute paths, parent traversal and drive/ADS-like prefixes must never
-    # leave the temporary import directory.
     if member.is_absolute() or ".." in parts:
         raise ValueError("Backup contém caminho inseguro.")
     if parts and (":" in parts[0] or parts[0].startswith("~")):
@@ -65,7 +118,6 @@ def validate_backup(source: Path) -> dict[str, Any]:
 
 
 def _extract_backup_safely(zf: zipfile.ZipFile, destination: Path) -> None:
-    """Extract a validated backup without relying on platform path semantics."""
     destination = destination.resolve()
     for info in zf.infolist():
         parts = _safe_zip_parts(info.filename)
@@ -92,7 +144,6 @@ def _relocate_path(raw: str, attachments_root: Path) -> str:
     if marker in normalized:
         suffix = normalized.split(marker, 1)[1]
         return str((attachments_root / Path(suffix)).resolve())
-    # Banco antigo pode guardar caminho relativo começando em attachments/.
     if normalized.startswith("attachments/"):
         return str((attachments_root / Path(normalized[len("attachments/"):])).resolve())
     return raw
@@ -101,38 +152,61 @@ def _relocate_path(raw: str, attachments_root: Path) -> str:
 def _relocate_db_paths(db_path: Path, attachments_root: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute("SELECT id, filepath FROM files").fetchall()
-        for row_id, raw in rows:
-            conn.execute("UPDATE files SET filepath=? WHERE id=?", (_relocate_path(raw, attachments_root), row_id))
-        # v0.1 simplificada: anexos das anotações também precisam sobreviver à mudança de pasta.
-        try:
-            rows = conn.execute("SELECT id, filepath FROM note_files").fetchall()
+        for table, column in (("files", "filepath"), ("note_files", "filepath")):
+            try:
+                rows = conn.execute(f"SELECT id, {column} FROM {table}").fetchall()
+            except sqlite3.OperationalError:
+                continue
             for row_id, raw in rows:
-                conn.execute("UPDATE note_files SET filepath=? WHERE id=?", (_relocate_path(raw, attachments_root), row_id))
+                conn.execute(f"UPDATE {table} SET {column}=? WHERE id=?", (_relocate_path(raw, attachments_root), row_id))
+        try:
+            rows = conn.execute("SELECT id, file_path FROM wall_posts WHERE file_path != ''").fetchall()
+            for row_id, raw in rows:
+                conn.execute("UPDATE wall_posts SET file_path=? WHERE id=?", (_relocate_path(raw, attachments_root), row_id))
         except sqlite3.OperationalError:
             pass
-        rows = conn.execute("SELECT id, file_path FROM wall_posts WHERE file_path != ''").fetchall()
-        for row_id, raw in rows:
-            conn.execute("UPDATE wall_posts SET file_path=? WHERE id=?", (_relocate_path(raw, attachments_root), row_id))
-        # Pendências não são transportadas entre instalações por segurança.
-        conn.execute("DELETE FROM pending_shares")
+        try:
+            conn.execute("DELETE FROM pending_shares")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
     finally:
         conn.close()
 
 
 def import_reposit(paths: AppPaths, source: Path) -> dict[str, Any]:
+    """Validate the complete backup before replacing any current user data."""
     manifest = validate_backup(source)
     with tempfile.TemporaryDirectory(prefix="reposit-import-") as tmp_name:
         tmp = Path(tmp_name)
         with zipfile.ZipFile(source, "r") as zf:
             _extract_backup_safely(zf, tmp)
-        backup_current = paths.data / "REPOSITINFOS.before-import.db"
-        if paths.db.exists():
-            shutil.copy2(paths.db, backup_current)
+        candidate = tmp / "data" / "REPOSITINFOS.db"
+        health = _db_health(candidate)
+        if not health["ok"]:
+            raise ValueError("O banco dentro do backup está corrompido ou inconsistente.")
+        if health["schema_version"] > CURRENT_SCHEMA_VERSION:
+            raise ValueError(f"Backup usa schema v{health['schema_version']}, mais novo que o suportado v{CURRENT_SCHEMA_VERSION}.")
+
+        # The current state gets its own full backup before the restore. If the
+        # restore later fails, the user still has a self-contained recovery file.
+        if paths.db.exists() and paths.db.stat().st_size:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            export_reposit(paths, paths.backups / f"RepositPlus-before-restore-{stamp}.reposit", include_attachments=True)
+
+        staged_db = paths.db.with_suffix(paths.db.suffix + ".restore")
+        shutil.copy2(candidate, staged_db)
+        _relocate_db_paths(staged_db, paths.attachments)
+        staged_health = _db_health(staged_db)
+        if not staged_health["ok"]:
+            staged_db.unlink(missing_ok=True)
+            raise ValueError("O backup ficou inconsistente durante a preparação da restauração.")
+
+        # Only now replace the live database. WAL sidecars from the old DB must
+        # never be replayed into the restored file.
         for sidecar in [paths.db.with_name(paths.db.name + "-wal"), paths.db.with_name(paths.db.name + "-shm")]:
             sidecar.unlink(missing_ok=True)
-        shutil.copy2(tmp / "data" / "REPOSITINFOS.db", paths.db)
+        os.replace(staged_db, paths.db)
         if (tmp / "data" / "settings.json").exists():
             shutil.copy2(tmp / "data" / "settings.json", paths.settings)
         imported_attachments = tmp / "attachments"
@@ -142,5 +216,6 @@ def import_reposit(paths: AppPaths, source: Path) -> dict[str, Any]:
                     dest = paths.attachments / file.relative_to(imported_attachments)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(file, dest)
+        # Relocate paths a second time after attachments are in their final root.
         _relocate_db_paths(paths.db, paths.attachments)
     return manifest

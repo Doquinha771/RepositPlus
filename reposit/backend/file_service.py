@@ -12,6 +12,7 @@ SAFE_EXTENSIONS = {
     ".xls", ".xlsx", ".ods", ".csv",
     ".ppt", ".pptx", ".odp",
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac",
     ".zip", ".rar", ".7z", ".py", ".js", ".html", ".css", ".sql", ".json"
 }
 MAX_FILE_SIZE = 150 * 1024 * 1024
@@ -47,18 +48,20 @@ def save_stream_to_controlled_path(stream, target_dir: Path, original_name: str,
     target = unique_path(target_dir / safe_name)
     digest = hashlib.sha256()
     total = 0
-    with target.open("wb") as out:
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_size:
-                out.close()
-                target.unlink(missing_ok=True)
-                raise ValueError("Arquivo excede o limite de 150 MB.")
-            digest.update(chunk)
-            out.write(chunk)
+    try:
+        with target.open("wb") as out:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_size:
+                    raise ValueError("Arquivo excede o limite de 150 MB.")
+                digest.update(chunk)
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
     return target, digest.hexdigest(), total
 
 

@@ -266,7 +266,14 @@
       focusSearch(false);
       load(search.value);
     },
-    beforeHide: () => flushState()
+    beforeHide: () => {
+      flushState();
+      requestToken += 1;
+      items.length = 0;
+      selectedIndex = 0;
+      if (results) results.replaceChildren();
+      setStatus('');
+    }
   };
 
   // Native activation and WebView focus do not always arrive in the same event

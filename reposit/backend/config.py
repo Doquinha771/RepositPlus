@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Reposit+"
-APP_VERSION = "0.7.1"
-APP_RELEASE_LABEL = "0.7.1 Stable"
+APP_VERSION = "0.7.4.2"
+APP_RELEASE_LABEL = "0.7.4.2 Stable"
 INTERNAL_NAME = "reposit-plus"
 DB_NAME = "REPOSITINFOS.db"
 
@@ -26,6 +26,8 @@ class AppPaths:
     pending: Path
     cache: Path
     logs: Path
+    backups: Path
+    thumbnails: Path
     frontend: Path
     identity: Path
     settings: Path
@@ -54,6 +56,8 @@ class AppPaths:
             pending=attachments / "pending",
             cache=data_root / "cache",
             logs=data_root / "logs",
+            backups=data_root / "backups",
+            thumbnails=data_root / "cache" / "thumbnails",
             frontend=resource_root / "frontend",
             identity=data / "identity.json",
             settings=data / "settings.json",
@@ -67,6 +71,8 @@ class AppPaths:
             paths.pending,
             paths.cache,
             paths.logs,
+            paths.backups,
+            paths.thumbnails,
         ]:
             directory.mkdir(parents=True, exist_ok=True)
         return paths
@@ -108,8 +114,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "db_warning_bytes": 1073741824,
     "memory_soft_limit_mb": 192,
     "hotkey": "ctrl+alt",
-    "ui_revision": 9,
+    "ui_revision": 15,
     "last_db_maintenance": 0,
+    "last_auto_backup": 0,
+    "restore_workspace": True,
+    "trash_retention_days": 30,
+    "safe_mode_auto": True,
 }
 
 
@@ -148,7 +158,11 @@ def load_settings(paths: AppPaths) -> dict[str, Any]:
     settings["db_warning_bytes"] = _clamp_int(settings.get("db_warning_bytes"), 1073741824, 104857600, 1099511627776)
     settings["memory_soft_limit_mb"] = _clamp_int(settings.get("memory_soft_limit_mb"), 192, 160, 384)
     settings["last_db_maintenance"] = _clamp_int(settings.get("last_db_maintenance"), 0, 0, 4102444800)
-    settings["ui_revision"] = 9
+    settings["last_auto_backup"] = _clamp_int(settings.get("last_auto_backup"), 0, 0, 4102444800)
+    settings["restore_workspace"] = bool(settings.get("restore_workspace", True))
+    settings["trash_retention_days"] = _clamp_int(settings.get("trash_retention_days"), 30, 0, 3650)
+    settings["safe_mode_auto"] = bool(settings.get("safe_mode_auto", True))
+    settings["ui_revision"] = 15
     _atomic_json_write(paths.settings, settings)
     return settings
 
